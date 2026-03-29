@@ -14,7 +14,7 @@ st.write("Upload an `.exe` file to visualize it as a Natraj grayscale image and 
 def load_my_model():
     # Use tensorflow-cpu to stay under the 1GB RAM limit
     import tensorflow as tf
-    return tf.keras.models.load_model("cnn.keras")
+    return tf.keras.models.load_model("cnn1.keras")
 
 model = load_my_model()
 
