@@ -1,77 +1,139 @@
 import streamlit as st
 import numpy as np
+import tensorflow as tf
 from PIL import Image
-import os
+import matplotlib.cm as cm
 
 # --- 1. Page Config ---
-st.set_page_config(page_title="Ransomware Detector", page_icon="🛡️")
-st.title("🛡️ Ransomware Binary Classifier")
-st.write("Upload an `.exe` file to visualize it as a Natraj grayscale image and predict its status.")
+st.set_page_config(page_title="Ransomware Detector XAI", page_icon="🔎", layout="wide")
+st.title("🔎 Ransomware Classifier with Grad-CAM")
+st.write("Upload an `.exe` file to classify it and visualize the exact byte regions the CNN focused on.")
 
-# --- 2. Load Model (Cached so it doesn't reload every time) ---
+# --- 2. Load Model ---
 @st.cache_resource
 def load_my_model():
-    # Using tensorflow-cpu keeps RAM usage low on cloud servers!
-    import tensorflow as tf
     return tf.keras.models.load_model("cnn1.keras")
 
 model = load_my_model()
 
-# --- 3. Natraj Logic ---
-def get_natraj_width(file_size_kb):
-    if file_size_kb < 10: return 32
-    elif file_size_kb < 30: return 64
-    elif file_size_kb < 60: return 128
-    elif file_size_kb < 100: return 256
-    elif file_size_kb < 200: return 384
-    elif file_size_kb < 500: return 512
-    elif file_size_kb < 1000: return 768
+# --- 3. Helper Functions ---
+def get_standard_width(file_size_bytes):
+    if file_size_bytes < 10 * 1024: return 32
+    elif file_size_bytes < 30 * 1024: return 64
+    elif file_size_bytes < 60 * 1024: return 128
+    elif file_size_bytes < 100 * 1024: return 256
+    elif file_size_bytes < 200 * 1024: return 384
+    elif file_size_bytes < 500 * 1024: return 512
+    elif file_size_bytes < 1000 * 1024: return 768
     else: return 1024
 
-# --- 4. The UI ---
-uploaded_file = st.file_uploader("Choose an executable file", type=["exe", "bin"])
+def get_last_conv_layer_name(keras_model):
+    for layer in reversed(keras_model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            return layer.name
+    return None
+
+def make_gradcam_heatmap(img_array, keras_model, last_conv_layer_name, pred_index=None):
+    # Create a clean input tensor
+    grad_model_input = tf.keras.Input(shape=(128, 128, 1))
+    x = grad_model_input
+    last_conv_output = None
+
+    # Re-connect the layers manually
+    for layer in keras_model.layers:
+        x = layer(x)
+        if layer.name == last_conv_layer_name:
+            last_conv_output = x
+
+    grad_model = tf.keras.models.Model(
+        inputs=grad_model_input,
+        outputs=[last_conv_output, x]
+    )
+
+    # Compute Gradient
+    with tf.GradientTape() as tape:
+        last_conv_layer_output, preds = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(preds[0])
+        class_channel = preds[:, pred_index]
+
+    grads = tape.gradient(class_channel, last_conv_layer_output)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    last_conv_layer_output = last_conv_layer_output[0]
+    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
+
+def create_overlay(pil_img, heatmap):
+    # Resize heatmap to match image
+    heatmap_resized = Image.fromarray(np.uint8(255 * heatmap)).resize((128, 128), resample=Image.BICUBIC)
+    heatmap_resized = np.array(heatmap_resized)
+    
+    # Apply Jet Colormap using Matplotlib instead of OpenCV
+    jet = cm.get_cmap("jet")
+    jet_colors = jet(np.arange(256))[:, :3]
+    jet_heatmap = jet_colors[heatmap_resized]
+    
+    # Convert original image to RGB
+    img_rgb = np.stack((np.array(pil_img),)*3, axis=-1) / 255.0
+    
+    # Superimpose
+    overlay = jet_heatmap * 0.4 + img_rgb * 0.6
+    overlay = np.uint8(255 * overlay)
+    return Image.fromarray(overlay)
+
+# --- 4. Main UI Flow ---
+uploaded_file = st.file_uploader("Choose an executable file (.exe)", type=["exe", "bin"])
 
 if uploaded_file is not None:
-    # Read bytes
-    bytes_data = uploaded_file.getvalue()
-    file_size_kb = len(bytes_data) / 1024
-    width = get_natraj_width(file_size_kb)
-    
-    # Natraj conversion
-    img_array = np.frombuffer(bytes_data, dtype=np.uint8)
-    height = len(img_array) // width
-    img_array = img_array[:height * width].reshape((height, width))
-    pil_img = Image.fromarray(img_array)
-
-    # Layout: Two columns
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Binary Visualization")
-        st.image(pil_img, use_container_width=True, caption=f"Width: {width}px")
-
-    with col2:
-        st.subheader("Model Prediction")
+    with st.spinner("Analyzing binary structure..."):
+        # 1. Process Bytes
+        bytes_data = uploaded_file.getvalue()
+        width = get_standard_width(len(bytes_data))
+        height = int(np.ceil(len(bytes_data) / width))
         
-        # ⚠️ CRITICAL UPDATE 1: Resize to 128x128 to match your new model
-        input_img = pil_img.resize((128, 128))
+        pad_len = (width * height) - len(bytes_data)
+        if pad_len > 0:
+            bytes_data += b'\x00' * pad_len
+            
+        img_array = np.frombuffer(bytes_data, dtype=np.uint8).reshape((height, width))
+        pil_img = Image.fromarray(img_array, 'L')
         
-        # Convert to numpy array
-        final_array = np.array(input_img).astype(np.float32)
+        # 2. Prepare for Model
+        img_resized = pil_img.resize((128, 128))
+        model_input = np.array(img_resized).astype(np.float32) / 255.0
+        model_input = np.expand_dims(model_input, axis=(0, -1))
         
-        # ⚠️ CRITICAL UPDATE 2: Normalize the pixels to match rescale=1./255
-        final_array = final_array / 255.0 
-        
-        # Add batch and channel dimensions: shape becomes (1, 128, 128, 1)
-        final_array = np.expand_dims(final_array, axis=(0, -1))
-        
-        # Predict
-        prediction = model.predict(final_array)
+        # 3. Predict
+        prediction = model.predict(model_input)
         prob = float(prediction[0][0])
         
-        # Output results
-        # Note: This assumes 0=Benign and 1=Ransomware based on alphabetical folder names
-        if prob > 0.5:
-            st.error(f"⚠️ RANSOMWARE DETECTED ({prob*100:.2f}%)")
-        else:
-            st.success(f"✅ BENIGN FILE ({ (1-prob)*100:.2f}%)")
+        # 4. Generate Heatmap
+        last_conv_name = get_last_conv_layer_name(model)
+        heatmap = make_gradcam_heatmap(model_input, model, last_conv_name)
+        overlay_img = create_overlay(img_resized, heatmap)
+
+    # --- Display Results ---
+    st.divider()
+    
+    if prob > 0.5:
+        st.error(f"### ⚠️ RANSOMWARE DETECTED (Confidence: {prob*100:.2f}%)")
+    else:
+        st.success(f"### ✅ BENIGN FILE (Confidence: {(1-prob)*100:.2f}%)")
+        
+    st.write(f"**Target Layer Analyzed:** `{last_conv_name}`")
+
+    # Display Images in 3 Columns
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.image(img_resized, caption="Raw Binary Image (128x128)", use_container_width=True)
+    with col2:
+        # Display standalone heatmap
+        jet = cm.get_cmap("jet")
+        heatmap_colored = jet(heatmap)[:, :, :3]
+        st.image(heatmap_colored, caption="Grad-CAM Heatmap", use_container_width=True)
+    with col3:
+        st.image(overlay_img, caption="Feature Overlay", use_container_width=True)
