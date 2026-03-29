@@ -1,3 +1,4 @@
 tensorflow-cpu
 pillow
 numpy
+matplotlib
