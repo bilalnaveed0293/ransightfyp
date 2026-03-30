@@ -15,7 +15,7 @@ st.markdown("---")
 # --- 2. Initialize Clients & Models ---
 @st.cache_resource
 def load_resources():
-    model = tf.keras.models.load_model("model.keras")
+    model = tf.keras.models.load_model("cnn1.keras")
     # Groq Key from Streamlit Secrets
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     return model, client
