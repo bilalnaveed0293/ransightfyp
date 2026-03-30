@@ -84,11 +84,11 @@ def get_ai_explanation(overlay_image, verdict, confidence):
     # 3. Use the supported Llama 4 Vision model
     MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct" 
 
-    prompt = f"""Analyze this Grad-CAM heatmap of an executable file. 
-    The CNN model classified it as {verdict} with {confidence:.2f}% confidence.
-    Red regions are high-importance byte clusters. 
-    Explain in 3 technical bullet points what these patterns usually represent in ransomware (e.g., PE headers, encrypted overlays, or resource sections).
-    keep it concise."""
+    prompt = f"""You are a senior Malware Analyst. A CNN model has classified this file as {verdict} 
+    with {confidence:.2f}% confidence. 
+    Analyze the provided Grad-CAM heatmap (red areas show where the model focused).
+    Explain why these byte patterns suggest ransomware characteristics (like encryption headers or packed sections).
+    Provide 3 concise technical points"""
 
     try:
         chat_completion = groq_client.chat.completions.create(
