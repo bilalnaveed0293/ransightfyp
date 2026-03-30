@@ -25,7 +25,7 @@ def load_resources():
     # Load CNN
     cnn = tf.keras.models.load_model("cnn1.keras")
     # Load LSTM
-    lstm = tf.keras.models.load_model("lstm_dynamic_model.h5")
+    lstm = tf.keras.models.load_model("ransomware_lstm_dynamic.h5")
     # Load Tokenizer
     with open("tokenizer.pkl", "rb") as f:
         tok = pickle.load(f)
