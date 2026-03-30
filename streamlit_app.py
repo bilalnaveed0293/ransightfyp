@@ -148,12 +148,22 @@ with tab2:
         HA_KEY = str(st.secrets["HYBRID_ANALYSIS_API_KEY"]).strip()
         HEADERS = {'api-key': HA_KEY, 'user-agent': 'Falcon Sandbox'}
         
-        # 1. Submission
+       # 1. Submission
         with st.spinner("Uploading to Hybrid Analysis..."):
             files = {'file': (uploaded_dynamic.name, uploaded_dynamic.read())}
             res = requests.post("https://www.hybrid-analysis.com/api/v2/submit/file", headers=HEADERS, files=files, data={'environment_id': 160})
-            job_id = res.json().get('job_id')
-            if not job_id: st.error("Upload failed."); st.stop()
+            
+            # --- NEW DEBUGGING LOGIC ---
+            try:
+                res_json = res.json()
+            except Exception:
+                st.error(f"Server returned a raw error. HTTP Status Code: {res.status_code}")
+                st.stop()
+                
+            job_id = res_json.get('job_id')
+            if not job_id: 
+                st.error(f"Upload failed! Hybrid Analysis returned this message: {res_json}")
+                st.stop()
 
         # 2. Polling
         bar = st.progress(0)
