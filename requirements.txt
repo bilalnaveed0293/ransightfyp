@@ -1,5 +1,9 @@
-tensorflow-cpu
-pillow
+streamlit
 numpy
+tensorflow
+Pillow
 matplotlib
 groq
+lime
+shap
+requests
