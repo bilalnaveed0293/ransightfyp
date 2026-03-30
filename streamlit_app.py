@@ -72,7 +72,7 @@ def create_overlay(pil_img, heatmap):
 
 # --- 4. Groq AI Integration ---
 def get_ai_explanation(overlay_image, verdict, confidence):
-    # 1. Ensure the image is in RGB mode (required for PNG/JPEG conversion)
+    # 1. Ensure the image is in RGB mode
     if overlay_image.mode != 'RGB':
         overlay_image = overlay_image.convert('RGB')
         
@@ -81,9 +81,8 @@ def get_ai_explanation(overlay_image, verdict, confidence):
     overlay_image.save(buffered, format="PNG")
     img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    # 3. Use the 90B model (usually more robust for vision tasks)
-    # Note: Ensure the model ID is exactly as supported by Groq
-    MODEL_ID = "llama-3.2-90b-vision-preview" 
+    # 3. Use the supported Llama 4 Vision model
+    MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct" 
 
     prompt = f"""Analyze this Grad-CAM heatmap of an executable file. 
     The CNN model classified it as {verdict} with {confidence:.2f}% confidence.
@@ -100,15 +99,16 @@ def get_ai_explanation(overlay_image, verdict, confidence):
                     {
                         "type": "image_url", 
                         "image_url": {
-                            "url": f"data:image/png;base64,{img_str}" # Explicitly match PNG here
+                            "url": f"data:image/png;base64,{img_str}" 
                         }
                     }
                 ]
             }],
-            temperature=0.2, # Lower temperature for more factual analysis
+            temperature=0.2, 
             max_tokens=512
         )
         return chat_completion.choices[0].message.content
+        
     except Exception as e:
         return f"⚠️ AI Analysis Error: {str(e)}"
 # --- 5. Main UI ---
