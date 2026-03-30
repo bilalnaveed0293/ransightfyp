@@ -87,7 +87,8 @@ def get_ai_explanation(overlay_image, verdict, confidence):
     prompt = f"""Analyze this Grad-CAM heatmap of an executable file. 
     The CNN model classified it as {verdict} with {confidence:.2f}% confidence.
     Red regions are high-importance byte clusters. 
-    Explain in 3 technical bullet points what these patterns usually represent in ransomware (e.g., PE headers, encrypted overlays, or resource sections)."""
+    Explain in 3 technical bullet points what these patterns usually represent in ransomware (e.g., PE headers, encrypted overlays, or resource sections).
+    keep it concise."""
 
     try:
         chat_completion = groq_client.chat.completions.create(
