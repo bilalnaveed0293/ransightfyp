@@ -144,7 +144,8 @@ with tab2:
     MAX_LEN = 520
 
     if uploaded_dynamic and st.button("Start Cloud Analysis"):
-        HA_KEY = st.secrets["HYBRID_ANALYSIS_API_KEY"]
+        # Force it to be a string and strip off any invisible newlines or spaces!
+        HA_KEY = str(st.secrets["HYBRID_ANALYSIS_API_KEY"]).strip()
         HEADERS = {'api-key': HA_KEY, 'user-agent': 'Falcon Sandbox'}
         
         # 1. Submission
