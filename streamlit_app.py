@@ -72,27 +72,45 @@ def create_overlay(pil_img, heatmap):
 
 # --- 4. Groq AI Integration ---
 def get_ai_explanation(overlay_image, verdict, confidence):
+    # 1. Ensure the image is in RGB mode (required for PNG/JPEG conversion)
+    if overlay_image.mode != 'RGB':
+        overlay_image = overlay_image.convert('RGB')
+        
+    # 2. Encode to PNG
     buffered = BytesIO()
     overlay_image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
+    img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    prompt = f"""You are a senior Malware Analyst. A CNN model has classified this file as {verdict} 
-    with {confidence:.2f}% confidence. 
-    Analyze the provided Grad-CAM heatmap (red areas show where the model focused).
-    Explain why these byte patterns suggest ransomware characteristics (like encryption headers or packed sections).
-    Provide 3 concise technical points."""
+    # 3. Use the 90B model (usually more robust for vision tasks)
+    # Note: Ensure the model ID is exactly as supported by Groq
+    MODEL_ID = "llama-3.2-90b-vision-preview" 
 
-    chat_completion = groq_client.chat.completions.create(
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}
-            ]
-        }],
-        model="llama-3.2-11b-vision-preview",
-    )
-    return chat_completion.choices[0].message.content
+    prompt = f"""Analyze this Grad-CAM heatmap of an executable file. 
+    The CNN model classified it as {verdict} with {confidence:.2f}% confidence.
+    Red regions are high-importance byte clusters. 
+    Explain in 3 technical bullet points what these patterns usually represent in ransomware (e.g., PE headers, encrypted overlays, or resource sections)."""
+
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url", 
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_str}" # Explicitly match PNG here
+                        }
+                    }
+                ]
+            }],
+            temperature=0.2, # Lower temperature for more factual analysis
+            max_tokens=512
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ AI Analysis Error: {str(e)}"  return chat_completion.choices[0].message.content
 
 # --- 5. Main UI ---
 uploaded_file = st.file_uploader("Upload suspicious .exe file", type=["exe"])
