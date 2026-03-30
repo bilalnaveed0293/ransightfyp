@@ -3,137 +3,134 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image
 import matplotlib.cm as cm
+import base64
+from io import BytesIO
+from groq import Groq
 
-# --- 1. Page Config ---
-st.set_page_config(page_title="Ransomware Detector XAI", page_icon="🔎", layout="wide")
-st.title("🔎 Ransomware Classifier with Grad-CAM")
-st.write("Upload an `.exe` file to classify it and visualize the exact byte regions the CNN focused on.")
+# --- 1. Page Config & Styling ---
+st.set_page_config(page_title="Ransight AI", page_icon="🛡️", layout="wide")
+st.title("🛡️ Ransight: CNN Static Analysis + AI Forensics")
+st.markdown("---")
 
-# --- 2. Load Model ---
+# --- 2. Initialize Clients & Models ---
 @st.cache_resource
-def load_my_model():
-    return tf.keras.models.load_model("cnn1.keras")
+def load_resources():
+    model = tf.keras.models.load_model("model.keras")
+    # Groq Key from Streamlit Secrets
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    return model, client
 
-model = load_my_model()
+model, groq_client = load_resources()
 
-# --- 3. Helper Functions ---
-def get_standard_width(file_size_bytes):
-    if file_size_bytes < 10 * 1024: return 32
-    elif file_size_bytes < 30 * 1024: return 64
-    elif file_size_bytes < 60 * 1024: return 128
-    elif file_size_bytes < 100 * 1024: return 256
-    elif file_size_bytes < 200 * 1024: return 384
-    elif file_size_bytes < 500 * 1024: return 512
-    elif file_size_bytes < 1000 * 1024: return 768
+# --- 3. Core Logic: Grad-CAM & Processing ---
+def get_standard_width(file_size):
+    if file_size < 10240: return 32
+    elif file_size < 30720: return 64
+    elif file_size < 61440: return 128
+    elif file_size < 102400: return 256
+    elif file_size < 204800: return 384
+    elif file_size < 512000: return 512
+    elif file_size < 1024000: return 768
     else: return 1024
 
-def get_last_conv_layer_name(keras_model):
+def make_gradcam_heatmap(img_array, keras_model):
+    # Find last conv layer automatically
+    last_conv_layer_name = None
     for layer in reversed(keras_model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
-            return layer.name
-    return None
-
-def make_gradcam_heatmap(img_array, keras_model, last_conv_layer_name, pred_index=None):
-    # Create a clean input tensor
+            last_conv_layer_name = layer.name
+            break
+            
     grad_model_input = tf.keras.Input(shape=(128, 128, 1))
     x = grad_model_input
     last_conv_output = None
-
-    # Re-connect the layers manually
     for layer in keras_model.layers:
         x = layer(x)
         if layer.name == last_conv_layer_name:
             last_conv_output = x
 
-    grad_model = tf.keras.models.Model(
-        inputs=grad_model_input,
-        outputs=[last_conv_output, x]
-    )
+    grad_model = tf.keras.models.Model(inputs=grad_model_input, outputs=[last_conv_output, x])
 
-    # Compute Gradient
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_array)
-        if pred_index is None:
-            pred_index = tf.argmax(preds[0])
-        class_channel = preds[:, pred_index]
+        class_channel = preds[:, 0]
 
     grads = tape.gradient(class_channel, last_conv_layer_output)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
+    heatmap = last_conv_layer_output[0] @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
     heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
     return heatmap.numpy()
 
 def create_overlay(pil_img, heatmap):
-    # Resize heatmap to match image
-    heatmap_resized = Image.fromarray(np.uint8(255 * heatmap)).resize((128, 128), resample=Image.BICUBIC)
-    heatmap_resized = np.array(heatmap_resized)
-    
-    # Apply Jet Colormap using Matplotlib instead of OpenCV
+    heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize((128, 128), resample=Image.BICUBIC)
     jet = cm.get_cmap("jet")
-    jet_colors = jet(np.arange(256))[:, :3]
-    jet_heatmap = jet_colors[heatmap_resized]
-    
-    # Convert original image to RGB
-    img_rgb = np.stack((np.array(pil_img),)*3, axis=-1) / 255.0
-    
-    # Superimpose
-    overlay = jet_heatmap * 0.4 + img_rgb * 0.6
-    overlay = np.uint8(255 * overlay)
+    jet_heatmap = (jet(np.array(heatmap_img))[:, :, :3] * 255).astype(np.uint8)
+    img_rgb = np.stack((np.array(pil_img),)*3, axis=-1)
+    overlay = (jet_heatmap * 0.4 + img_rgb * 0.6).astype(np.uint8)
     return Image.fromarray(overlay)
 
-# --- 4. Main UI Flow ---
-uploaded_file = st.file_uploader("Choose an executable file (.exe)", type=["exe", "bin"])
+# --- 4. Groq AI Integration ---
+def get_ai_explanation(overlay_image, verdict, confidence):
+    buffered = BytesIO()
+    overlay_image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
 
-if uploaded_file is not None:
-    with st.spinner("Analyzing binary structure..."):
-        # 1. Process Bytes
-        bytes_data = uploaded_file.getvalue()
-        width = get_standard_width(len(bytes_data))
-        height = int(np.ceil(len(bytes_data) / width))
+    prompt = f"""You are a senior Malware Analyst. A CNN model has classified this file as {verdict} 
+    with {confidence:.2f}% confidence. 
+    Analyze the provided Grad-CAM heatmap (red areas show where the model focused).
+    Explain why these byte patterns suggest ransomware characteristics (like encryption headers or packed sections).
+    Provide 3 concise technical points."""
+
+    chat_completion = groq_client.chat.completions.create(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}
+            ]
+        }],
+        model="llama-3.2-11b-vision-preview",
+    )
+    return chat_completion.choices[0].message.content
+
+# --- 5. Main UI ---
+uploaded_file = st.file_uploader("Upload suspicious .exe file", type=["exe"])
+
+if uploaded_file:
+    with st.spinner("Converting binary to image and analyzing..."):
+        # Process file
+        data = uploaded_file.read()
+        width = get_standard_width(len(data))
+        height = int(np.ceil(len(data) / width))
+        img_raw = np.frombuffer(data, dtype=np.uint8)
+        img_raw = np.pad(img_raw, (0, (width * height) - len(data)))
+        pil_img = Image.fromarray(img_raw.reshape((height, width)), 'L').resize((128, 128))
         
-        pad_len = (width * height) - len(bytes_data)
-        if pad_len > 0:
-            bytes_data += b'\x00' * pad_len
-            
-        img_array = np.frombuffer(bytes_data, dtype=np.uint8).reshape((height, width))
-        pil_img = Image.fromarray(img_array, 'L')
-        
-        # 2. Prepare for Model
-        img_resized = pil_img.resize((128, 128))
-        model_input = np.array(img_resized).astype(np.float32) / 255.0
-        model_input = np.expand_dims(model_input, axis=(0, -1))
-        
-        # 3. Predict
-        prediction = model.predict(model_input)
+        # Predict
+        input_arr = np.array(pil_img).astype('float32') / 255.0
+        input_arr = np.expand_dims(input_arr, axis=(0, -1))
+        prediction = model.predict(input_arr)
         prob = float(prediction[0][0])
-        
-        # 4. Generate Heatmap
-        last_conv_name = get_last_conv_layer_name(model)
-        heatmap = make_gradcam_heatmap(model_input, model, last_conv_name)
-        overlay_img = create_overlay(img_resized, heatmap)
+        verdict = "RANSOMWARE" if prob > 0.5 else "BENIGN"
+        conf = prob if prob > 0.5 else (1 - prob)
 
-    # --- Display Results ---
-    st.divider()
-    
-    if prob > 0.5:
-        st.error(f"### ⚠️ RANSOMWARE DETECTED (Confidence: {prob*100:.2f}%)")
-    else:
-        st.success(f"### ✅ BENIGN FILE (Confidence: {(1-prob)*100:.2f}%)")
-        
-    st.write(f"**Target Layer Analyzed:** `{last_conv_name}`")
+        # Heatmap
+        heatmap = make_gradcam_heatmap(input_arr, model)
+        overlay = create_overlay(pil_img, heatmap)
 
-    # Display Images in 3 Columns
-    col1, col2, col3 = st.columns(3)
-    
+    # UI Display
+    col1, col2 = st.columns([1, 1])
     with col1:
-        st.image(img_resized, caption="Raw Binary Image (128x128)", use_container_width=True)
+        if verdict == "RANSOMWARE":
+            st.error(f"### Result: {verdict} ({conf*100:.1f}%)")
+        else:
+            st.success(f"### Result: {verdict} ({conf*100:.1f}%)")
+        st.image(overlay, caption="Grad-CAM Focus Overlay", use_container_width=True)
+
     with col2:
-        # Display standalone heatmap
-        jet = cm.get_cmap("jet")
-        heatmap_colored = jet(heatmap)[:, :, :3]
-        st.image(heatmap_colored, caption="Grad-CAM Heatmap", use_container_width=True)
-    with col3:
-        st.image(overlay_img, caption="Feature Overlay", use_container_width=True)
+        st.subheader("🤖 AI Forensic Report")
+        if st.button("Generate AI Explanation"):
+            with st.spinner("Groq is decoding patterns..."):
+                report = get_ai_explanation(overlay, verdict, conf*100)
+                st.markdown(report)
