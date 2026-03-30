@@ -110,8 +110,7 @@ def get_ai_explanation(overlay_image, verdict, confidence):
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
-        return f"⚠️ AI Analysis Error: {str(e)}"  return chat_completion.choices[0].message.content
-
+        return f"⚠️ AI Analysis Error: {str(e)}"
 # --- 5. Main UI ---
 uploaded_file = st.file_uploader("Upload suspicious .exe file", type=["exe"])
 
