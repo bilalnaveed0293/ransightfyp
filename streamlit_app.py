@@ -159,7 +159,7 @@ with tab2:
             
             # FIX 1: Using 'status' instead of 'state'
             current_status = check_res.get('status', 'unknown')
-            bar.progress(min((i+1)*3.3, 100))
+            bar.progress(int(min((i+1)*3.3, 100)))
             status.text(f"Sandbox Status: {current_status}...")
             
             # Triage moves from 'pending' -> 'running' -> 'completed'
