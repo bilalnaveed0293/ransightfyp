@@ -128,233 +128,231 @@ with tab1:
                 )
                 st.write(response.choices[0].message.content)
 with tab2:
-    st.header("Dynamic Analysis: Triage Sandbox & LIME")
-    st.markdown("Standardized **60-second execution**. Extracting 500 APIs, 10 DLLs, and 10 Mutexes.")
+            st.header("Dynamic Analysis: Triage Sandbox & LIME")
+            st.markdown("Standardized **60-second execution**. Extracting 500 APIs, 10 DLLs, and 10 Mutexes.")
 
-    uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
+            uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
-    if uploaded_dynamic and st.button("Start Full Analysis"):
-        import streamlit.components.v1 as components
-        import json
-        import time
-        import requests
-        import numpy as np
-        from lime.lime_text import LimeTextExplainer
-        # Assuming tokenizer and pad_sequences are already imported at the top of your script
+            if uploaded_dynamic and st.button("Start Full Analysis"):
+                import streamlit.components.v1 as components
+                import json
+                import time
+                import requests
+                import numpy as np
+                from lime.lime_text import LimeTextExplainer
 
-        API_KEY = st.secrets["TRIAGE_API_KEY"]
-        HEADERS = {"Authorization": f"Bearer {API_KEY}"}
-        BASE_URL = "https://api.tria.ge/v0"
+                API_KEY = st.secrets["TRIAGE_API_KEY"]
+                HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+                BASE_URL = "https://api.tria.ge/v0"
 
-        # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
-        with st.spinner("Uploading to Triage sandbox..."):
-            files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            data  = {"_json": '{"kind":"file","interactive":false}'}
+                # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
+                with st.spinner("Uploading to Triage sandbox..."):
+                    files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
+                    data  = {"_json": '{"kind":"file","interactive":false}'}
 
-            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
-            if res.status_code not in (200, 201):
-                st.error(f"Submission failed ({res.status_code}): {res.text}")
-                st.stop()
+                    res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
+                    if res.status_code not in (200, 201):
+                        st.error(f"Submission failed ({res.status_code}): {res.text}")
+                        st.stop()
 
-            sample_id = res.json().get("id")
-            if not sample_id:
-                st.error(f"No sample ID in response: {res.json()}")
-                st.stop()
-            st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
+                    sample_id = res.json().get("id")
+                    if not sample_id:
+                        st.error(f"No sample ID in response: {res.json()}")
+                        st.stop()
+                    st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
 
-        # ── STEP 2: TRIGGER AUTO PROFILE ────────────────────────────────────────
-        with st.spinner("Selecting analysis profile..."):
-            profile_res = requests.post(
-                f"{BASE_URL}/samples/{sample_id}/profile",
-                headers={**HEADERS, "Content-Type": "application/json"},
-                data=json.dumps({"auto": True})
-            )
-            if profile_res.status_code not in (200, 201, 409):
-                st.warning(f"Profile returned {profile_res.status_code}: {profile_res.text}")
-            else:
-                st.info("✅ Profile selected — behavioral analysis starting...")
+                # ── STEP 2: TRIGGER AUTO PROFILE ────────────────────────────────────────
+                with st.spinner("Selecting analysis profile..."):
+                    profile_res = requests.post(
+                        f"{BASE_URL}/samples/{sample_id}/profile",
+                        headers={**HEADERS, "Content-Type": "application/json"},
+                        data=json.dumps({"auto": True})
+                    )
+                    if profile_res.status_code not in (200, 201, 409):
+                        st.warning(f"Profile returned {profile_res.status_code}: {profile_res.text}")
+                    else:
+                        st.info("✅ Profile selected — behavioral analysis starting...")
 
-        # ── STEP 3: POLL UNTIL REPORTED (up to 5 min) ──────────────────────────
-        bar         = st.progress(0)
-        status_text = st.empty()
-        MAX_ITER    = 60
-        curr_status = "pending"
+                # ── STEP 3: POLL UNTIL REPORTED (up to 5 min) ──────────────────────────
+                bar         = st.progress(0)
+                status_text = st.empty()
+                MAX_ITER    = 60
+                curr_status = "pending"
 
-        for i in range(MAX_ITER):
-            time.sleep(5)
-            chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
-            if chk.status_code != 200:
-                continue
-            curr_status = chk.json().get("status", "unknown")
-            bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
-            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
-            if curr_status in ("reported", "failed"):
-                break
-
-        if curr_status == "failed":
-            st.error("Triage analysis failed. The sample may be corrupted or unsupported.")
-            st.stop()
-        if curr_status != "reported":
-            st.warning("Triage timed out.")
-            st.stop()
-
-        # ── STEP 4: GET FULL TASK IDs FROM SAMPLE RESPONSE ──────────────────────
-        sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
-        tasks_raw   = sample_info.get("tasks", {})
-
-        behavioral_tasks = []
-        if isinstance(tasks_raw, dict):
-            for full_tid, tinfo in tasks_raw.items():
-                if tinfo.get("kind") == "behavioral":
-                    behavioral_tasks.append(full_tid)
-        elif isinstance(tasks_raw, list):
-            for t in tasks_raw:
-                tid = t.get("id", "")
-                if tid.startswith("behavioral"):
-                    # Use standard fallback if short ID is provided
-                    full_tid = f"{sample_id}-{tid}" if "-" not in tid else tid
-                    behavioral_tasks.append(full_tid)
-
-        if not behavioral_tasks:
-            st.error(f"No behavioral tasks found. Raw tasks: {tasks_raw}")
-            st.stop()
-
-        st.info(f"Behavioral tasks found: {behavioral_tasks}")
-
-        # ── STEP 5: FETCH onemon.json USING FULL TASK ID ────────────────────────
-        raw_apis    = []
-        raw_dlls    = []
-        raw_mutexes = []
-        successful_task = None
-
-        for full_task_id in behavioral_tasks:
-            st.info(f"Fetching onemon.json for task `{full_task_id}`...")
-
-            # Wait for specific task to be reported
-            for _ in range(20):
-                task_chk = requests.get(
-                    f"{BASE_URL}/samples/{sample_id}/{full_task_id}",
-                    headers=HEADERS
-                )
-                if task_chk.status_code == 200:
-                    if task_chk.json().get("status") == "reported":
+                for i in range(MAX_ITER):
+                    time.sleep(5)
+                    chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
+                    if chk.status_code != 200:
+                        continue
+                    curr_status = chk.json().get("status", "unknown")
+                    bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
+                    status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
+                    if curr_status in ("reported", "failed"):
                         break
-                time.sleep(5)
 
-            onemon_res = requests.get(
-                f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json",
-                headers=HEADERS,
-                stream=True
-            )
+                if curr_status == "failed":
+                    st.error("Triage analysis failed. The sample may be corrupted or unsupported.")
+                    st.stop()
+                if curr_status != "reported":
+                    st.warning("Triage timed out.")
+                    st.stop()
 
-            if onemon_res.status_code != 200:
-                # If full_task_id fails, sometimes Triage just uses the short ID (e.g., 'behavioral1')
-                short_id = full_task_id.split("-")[-1]
-                onemon_res = requests.get(
-                    f"{BASE_URL}/samples/{sample_id}/{short_id}/logs/onemon.json",
-                    headers=HEADERS,
-                    stream=True
-                )
-                if onemon_res.status_code != 200:
-                    st.warning(f"onemon.json returned {onemon_res.status_code} for `{full_task_id}` — trying next...")
-                    continue
+                # ── STEP 4: GET FULL TASK IDs FROM SAMPLE RESPONSE ──────────────────────
+                sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+                tasks_raw   = sample_info.get("tasks", {})
 
-            # Parse NDJSON
-            kind_counts  = {}
-            task_apis    = []
-            task_dlls    = []
-            task_mutexes = []
+                behavioral_tasks = []
+                if isinstance(tasks_raw, dict):
+                    for full_tid, tinfo in tasks_raw.items():
+                        if tinfo.get("kind") == "behavioral":
+                            behavioral_tasks.append(full_tid)
+                elif isinstance(tasks_raw, list):
+                    for t in tasks_raw:
+                        tid = t.get("id", "")
+                        if tid.startswith("behavioral"):
+                            # Use standard fallback if short ID is provided
+                            full_tid = f"{sample_id}-{tid}" if "-" not in tid else tid
+                            behavioral_tasks.append(full_tid)
 
-            for line in onemon_res.iter_lines():
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                if not behavioral_tasks:
+                    st.error(f"No behavioral tasks found. Raw tasks: {tasks_raw}")
+                    st.stop()
 
-                kind = event.get("kind", "")
-                kind_counts[kind] = kind_counts.get(kind, 0) + 1
-                evt  = event.get("event", {})
+                st.info(f"Behavioral tasks found: {behavioral_tasks}")
 
-                # API calls
-                if kind == "onemon.Call":
-                    api_name = evt.get("api") or evt.get("symbol") or evt.get("name")
-                    if api_name:
-                        task_apis.append(api_name)
+                # ── STEP 5: FETCH onemon.json USING FULL TASK ID ────────────────────────
+                raw_apis    = []
+                raw_dlls    = []
+                raw_mutexes = []
+                successful_task = None
 
-                # DLL loads
-                elif kind in ("onemon.Module", "onemon.ImageLoad"):
-                    image_path = evt.get("filepath") or evt.get("image") or ""
-                    if image_path:
-                        dll_name = image_path.replace("\\", "/").split("/")[-1]
-                        if dll_name.lower().endswith(".dll"):
-                            task_dlls.append(dll_name)
+                for full_task_id in behavioral_tasks:
+                    st.info(f"Fetching onemon.json for task `{full_task_id}`...")
 
-                # Mutexes (CRITICAL FIX: Triage maps Mutexes to Handle -> type: Mutant)
-                elif kind == "onemon.Handle":
-                    if evt.get("type") == "Mutant":
-                        name = evt.get("name", "")
-                        if name:
-                            task_mutexes.append(name)
+                    # Wait for specific task to be reported
+                    for _ in range(20):
+                        task_chk = requests.get(
+                            f"{BASE_URL}/samples/{sample_id}/{full_task_id}",
+                            headers=HEADERS
+                        )
+                        if task_chk.status_code == 200:
+                            if task_chk.json().get("status") == "reported":
+                                break
+                        time.sleep(5)
 
-            with st.expander(f"🔍 Kind counts for `{full_task_id}`"):
-                st.json(kind_counts)
+                    onemon_res = requests.get(
+                        f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json",
+                        headers=HEADERS,
+                        stream=True
+                    )
 
-            if task_apis or task_dlls:
-                raw_apis    = task_apis
-                raw_dlls    = task_dlls
-                raw_mutexes = task_mutexes
-                successful_task = full_task_id
-                st.success(f"✅ Got behavioral data from task: `{full_task_id}`")
-                break
-            else:
-                st.warning(f"No API/DLL data in `{full_task_id}` — trying next task...")
+                    if onemon_res.status_code != 200:
+                        # Fallback: try the short ID just in case
+                        short_id = full_task_id.split("-")[-1]
+                        onemon_res = requests.get(
+                            f"{BASE_URL}/samples/{sample_id}/{short_id}/logs/onemon.json",
+                            headers=HEADERS,
+                            stream=True
+                        )
+                        if onemon_res.status_code != 200:
+                            st.warning(f"onemon.json returned {onemon_res.status_code} for `{full_task_id}` — trying next...")
+                            continue
 
-        # ── STEP 6: DEBUG & SEQUENCE PREPARATION ────────────────────────────────
-        with st.expander("🔍 Extraction Summary"):
-            st.write(f"Successful task: `{successful_task}`")
-            st.write(f"APIs: **{len(raw_apis)}** | DLLs: **{len(raw_dlls)}** | Mutexes: **{len(raw_mutexes)}**")
-            st.write("Sample APIs:",    raw_apis[:15])
-            st.write("Sample DLLs:",    raw_dlls[:10])
-            st.write("Sample Mutexes:", raw_mutexes[:10])
+                    # Parse NDJSON
+                    kind_counts  = {}
+                    task_apis    = []
+                    task_dlls    = []
+                    task_mutexes = []
 
-        # Enforce exact length constraints
-        final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+                    for line in onemon_res.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-        if not final_sequence.strip():
-            st.error("All behavioral tasks returned empty data. If `onemon.Call` is missing in the counts above, this sample evaded the kernel driver.")
-            st.stop()
+                        kind = event.get("kind", "")
+                        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                        evt  = event.get("event", {})
 
-        # ── STEP 7: LSTM PREDICTION ─────────────────────────────────────────────
-        def predict_proba(texts):
-            seqs   = tokenizer.texts_to_sequences(texts)
-            padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
-            preds  = lstm_model.predict(padded)
-            # Ensure output is in [Prob_Benign, Prob_Ransomware] format for LIME
-            if preds.shape[1] == 1:
-                return np.hstack([1 - preds, preds])
-            return preds
+                        # 1. API Calls (Catch standard calls AND kernel Syscalls)
+                        if kind == "onemon.Call" or kind.startswith("onemon.Syscall"):
+                            api_name = evt.get("api") or evt.get("symbol") or evt.get("name") or evt.get("syscall")
+                            if api_name:
+                                task_apis.append(api_name)
 
-        probs = predict_proba([final_sequence])[0]
+                        # 2. DLL loads
+                        elif kind in ("onemon.Module", "onemon.ImageLoad"):
+                            image_path = evt.get("filepath") or evt.get("image") or ""
+                            if image_path:
+                                dll_name = image_path.replace("\\", "/").split("/")[-1]
+                                if dll_name.lower().endswith(".dll"):
+                                    task_dlls.append(dll_name)
 
-        st.divider()
-        if probs[1] > 0.5:
-            st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
-        else:
-            st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
+                        # 3. Mutexes (Catch both direct Mutant events and Handle events)
+                        elif kind == "onemon.Mutant" or (kind == "onemon.Handle" and evt.get("type") == "Mutant"):
+                            name = evt.get("name", "")
+                            if name:
+                                task_mutexes.append(name)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
-        with col2:
-            st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
+                    with st.expander(f"🔍 Kind counts for `{full_task_id}`"):
+                        st.json(kind_counts)
 
-        # ── STEP 8: LIME EXPLANATION ────────────────────────────────────────────
-        with st.spinner("Generating LIME explanation..."):
-            explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
-            exp = explainer.explain_instance(
-                final_sequence, predict_proba, num_features=10
-            )
-            st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
-            components.html(exp.as_html(), height=600, scrolling=True)
+                    if task_apis or task_dlls or task_mutexes:
+                        raw_apis    = task_apis
+                        raw_dlls    = task_dlls
+                        raw_mutexes = task_mutexes
+                        successful_task = full_task_id
+                        st.success(f"✅ Got behavioral data from task: `{full_task_id}`")
+                        break
+                    else:
+                        st.warning(f"No API/DLL/Mutex data extracted in `{full_task_id}` — trying next task...")
+
+                # ── STEP 6: DEBUG & SEQUENCE PREPARATION ────────────────────────────────
+                with st.expander("🔍 Extraction Summary"):
+                    st.write(f"Successful task: `{successful_task}`")
+                    st.write(f"APIs: **{len(raw_apis)}** | DLLs: **{len(raw_dlls)}** | Mutexes: **{len(raw_mutexes)}**")
+                    st.write("Sample APIs:",    raw_apis[:15])
+                    st.write("Sample DLLs:",    raw_dlls[:10])
+                    st.write("Sample Mutexes:", raw_mutexes[:10])
+
+                # Enforce exact length constraints
+                final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+
+                if not final_sequence.strip():
+                    st.error("All behavioral tasks returned empty data. Check kind counts above to verify if any actions were logged.")
+                    st.stop()
+
+                # ── STEP 7: LSTM PREDICTION ─────────────────────────────────────────────
+                def predict_proba(texts):
+                    seqs   = tokenizer.texts_to_sequences(texts)
+                    padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
+                    preds  = lstm_model.predict(padded)
+                    # Ensure output is in [Prob_Benign, Prob_Ransomware] format for LIME
+                    if preds.shape[1] == 1:
+                        return np.hstack([1 - preds, preds])
+                    return preds
+
+                probs = predict_proba([final_sequence])[0]
+
+                st.divider()
+                if probs[1] > 0.5:
+                    st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
+                else:
+                    st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
+                with col2:
+                    st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
+
+                # ── STEP 8: LIME EXPLANATION ────────────────────────────────────────────
+                with st.spinner("Generating LIME explanation..."):
+                    explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
+                    exp = explainer.explain_instance(
+                        final_sequence, predict_proba, num_features=10
+                    )
+                    st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
+                    components.html(exp.as_html(), height=600, scrolling=True)
