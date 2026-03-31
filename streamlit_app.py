@@ -222,7 +222,17 @@ with tab2:
                     if task_chk.json().get("status") == "reported":
                         break
                 time.sleep(5)
-
+        # ── DEBUG: List all available files for this task ───────────────────────
+        # Use this to check if 'report_triage.json' is listed in the output
+        files_res = requests.get(
+            f"{BASE_URL}/samples/{sample_id}/{task_id}/files",
+            headers=HEADERS
+        )
+        with st.expander("🔍 Available task files (debug)"):
+            if files_res.status_code == 200:
+                st.json(files_res.json())
+            else:
+                st.error(f"Could not fetch file list. Status: {files_res.status_code}")
         # ── STEP 6: FETCH onemon.json ───────────────────────────────────────────
         with st.spinner("Downloading behavioral event log..."):
             onemon_res = requests.get(
