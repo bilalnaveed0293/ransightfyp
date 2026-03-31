@@ -145,25 +145,26 @@ with tab2:
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         BASE_URL = "https://api.tria.ge/v0"
 
-        # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
-        with st.spinner("Uploading to Triage sandbox..."):
-            files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            # FIX: correct profile key is "profile" not "pk"
-            data = {
-                "_json": '{"kind":"file","interactive":false,"profiles":[{"profile":"win10","timeout":60}]}'
-            }
-            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
+       # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
+with st.spinner("Uploading to Triage sandbox..."):
+    files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
+    
+    # FIX: Don't specify profiles — only company accounts can do that.
+    # Let Triage auto-select the best environment (will still pick Windows for .exe)
+    data = {"_json": '{"kind":"file","interactive":false}'}
+    
+    res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
 
-            if res.status_code not in (200, 201):
-                st.error(f"Submission failed ({res.status_code}): {res.text}")
-                st.stop()
+    if res.status_code not in (200, 201):
+        st.error(f"Submission failed ({res.status_code}): {res.text}")
+        st.stop()
 
-            sample_id = res.json().get("id")
-            if not sample_id:
-                st.error(f"No sample ID returned. Response: {res.json()}")
-                st.stop()
+    sample_id = res.json().get("id")
+    if not sample_id:
+        st.error(f"No sample ID returned. Response: {res.json()}")
+        st.stop()
 
-            st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for 60s execution + reporting...")
+    st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for execution + reporting...")
 
         # ── STEP 2: POLL SAMPLE STATUS (up to 5 minutes) ────────────────────────
         bar = st.progress(0)
