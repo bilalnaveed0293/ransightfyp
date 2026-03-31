@@ -159,14 +159,13 @@ with tab2:
             st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
 
         # ── STEP 2: TRIGGER AUTO PROFILE ────────────────────────────────────────
-        # Critical: tells Triage to auto-select best profile and start behavioral run
         with st.spinner("Selecting analysis profile..."):
             profile_res = requests.post(
                 f"{BASE_URL}/samples/{sample_id}/profile",
                 headers={**HEADERS, "Content-Type": "application/json"},
                 data=json.dumps({"auto": True})
             )
-            if profile_res.status_code not in (200, 201):
+            if profile_res.status_code not in (200, 201, 409):
                 st.warning(f"Profile auto-select returned {profile_res.status_code}: {profile_res.text} — continuing anyway...")
             else:
                 st.info("✅ Profile selected — behavioral analysis starting...")
@@ -182,8 +181,7 @@ with tab2:
             chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
             if chk.status_code != 200:
                 continue
-            chk_json    = chk.json()
-            curr_status = chk_json.get("status", "unknown")
+            curr_status = chk.json().get("status", "unknown")
             bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
             status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
             if curr_status in ("reported", "failed"):
@@ -198,31 +196,17 @@ with tab2:
 
         # ── STEP 4: RESOLVE TASK ID ─────────────────────────────────────────────
         sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+        tasks_raw   = sample_info.get("tasks", [])
 
-        with st.expander("🔍 Raw sample_info (debug — remove later)"):
-            st.json(sample_info)
-
-        tasks_raw = sample_info.get("tasks", {})
-        task_id   = None
-
-        if isinstance(tasks_raw, dict):
-            for tid, tinfo in tasks_raw.items():
-                if isinstance(tinfo, dict) and tinfo.get("kind") == "behavioral":
-                    task_id = tid
-                    break
-            if not task_id and tasks_raw:
-                task_id = list(tasks_raw.keys())[0]
-
-        elif isinstance(tasks_raw, list):
-            for t in tasks_raw:
-                if t.get("kind") == "behavioral":
-                    task_id = t.get("id")
-                    break
-            if not task_id and tasks_raw:
-                task_id = tasks_raw[0].get("id")
+        # tasks is a LIST — pick first entry whose id starts with "behavioral"
+        task_id = None
+        for t in tasks_raw:
+            if t.get("id", "").startswith("behavioral"):
+                task_id = t.get("id")
+                break
 
         if not task_id:
-            st.error("No behavioral task found. See raw sample_info above for structure.")
+            st.error(f"No behavioral task found. Tasks returned: {tasks_raw}")
             st.stop()
 
         st.info(f"Task ID: `{task_id}`")
@@ -239,7 +223,7 @@ with tab2:
                         break
                 time.sleep(5)
 
-        # ── STEP 6: FETCH onemon.json (actual behavioral event log) ─────────────
+        # ── STEP 6: FETCH onemon.json ───────────────────────────────────────────
         with st.spinner("Downloading behavioral event log..."):
             onemon_res = requests.get(
                 f"{BASE_URL}/samples/{sample_id}/{task_id}/logs/onemon.json",
@@ -251,7 +235,7 @@ with tab2:
             st.error(f"Failed to fetch onemon.json (HTTP {onemon_res.status_code}): {onemon_res.text}")
             st.stop()
 
-        # ── STEP 7: PARSE onemon.json (JSONL — one event per line) ──────────────
+        # ── STEP 7: PARSE onemon.json (NDJSON — one event per line) ─────────────
         raw_apis    = []
         raw_dlls    = []
         raw_mutexes = []
@@ -280,11 +264,13 @@ with tab2:
                     if dll_name.lower().endswith(".dll"):
                         raw_dlls.append(dll_name)
 
-            # Mutex creation — captured both as dedicated event and as a call
+            # Mutexes — dedicated event
             elif kind in ("mutex", "CreateMutant"):
                 name = event.get("name") or event.get("mutex", "")
                 if name:
                     raw_mutexes.append(name)
+
+            # Mutexes — captured inside API call events
             elif kind == "call" and event.get("call", "").lower() in (
                 "ntcreatemutant", "createmutexw", "createmutexexw", "createmutexexa"
             ):
@@ -309,6 +295,7 @@ with tab2:
             st.write("Sample DLLs:",    raw_dlls[:10])
             st.write("Sample Mutexes:", raw_mutexes[:10])
 
+        # Build sequence matching Xran training format exactly
         final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
 
         if not final_sequence.strip():
