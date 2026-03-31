@@ -144,137 +144,144 @@ with tab2:
         # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
         with st.spinner("Uploading to Triage sandbox..."):
             files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-
-            submission_json = json.dumps({
-                "kind": "file",
-                "interactive": False,
-                "profiles": [
-                    {
-                        "profile": {
-                            "tags": ["os:windows10-2004-x64"],
-                            "timeout": 60,
-                            "network": "internet"
-                        }
-                    }
-                ]
-            })
-            data = {"_json": submission_json}
+            data  = {"_json": '{"kind":"file","interactive":false}'}
 
             res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
-
             if res.status_code not in (200, 201):
                 st.error(f"Submission failed ({res.status_code}): {res.text}")
                 st.stop()
 
             sample_id = res.json().get("id")
             if not sample_id:
-                st.error(f"No sample ID returned. Response: {res.json()}")
+                st.error(f"No sample ID in response: {res.json()}")
                 st.stop()
 
-            st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for execution + reporting...")
+            st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
 
-        # ── STEP 2: POLL SAMPLE STATUS (up to 5 minutes) ────────────────────────
-        bar = st.progress(0)
+        # ── STEP 2: POLL UNTIL REPORTED (up to 5 min) ──────────────────────────
+        bar         = st.progress(0)
         status_text = st.empty()
-        MAX_WAIT = 60  # 60 × 5s = 300s
+        MAX_ITER    = 60   # 60 × 5s = 300s
         curr_status = "pending"
 
-        for i in range(MAX_WAIT):
+        for i in range(MAX_ITER):
             time.sleep(5)
-            check = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
-            if check.status_code != 200:
+            chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
+            if chk.status_code != 200:
                 continue
-            curr_status = check.json().get("status", "unknown")
-            bar.progress(int(min((i + 1) / MAX_WAIT * 100, 100)))
-            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_WAIT*5}s)")
+            curr_status = chk.json().get("status", "unknown")
+            bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
+            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
             if curr_status in ("reported", "failed"):
                 break
 
         if curr_status == "failed":
-            st.error("Triage analysis failed. The sample may have crashed or been rejected.")
+            st.error("Triage analysis failed — sample may have crashed or been rejected.")
             st.stop()
-
         if curr_status != "reported":
-            st.warning("Triage did not finish in time. Try again or check the sample manually on tria.ge.")
+            st.warning("Triage timed out. Check the sample manually on tria.ge.")
             st.stop()
 
-        # ── STEP 3: WAIT FOR BEHAVIORAL TASK TO BE READY ────────────────────────
-        with st.spinner("Finalizing behavioral logs..."):
-            for _ in range(20):
-                task_check = requests.get(
-                    f"{BASE_URL}/samples/{sample_id}/behavioral1",
-                    headers=HEADERS
-                )
-                if task_check.status_code == 200:
-                    if task_check.json().get("status") == "reported":
-                        break
-                time.sleep(5)
+        # ── STEP 3: RESOLVE TASK ID ─────────────────────────────────────────────
+        sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+        tasks_raw   = sample_info.get("tasks", {})
 
-        # ── STEP 4: FETCH BEHAVIORAL JSON REPORT ────────────────────────────────
-        report_res = requests.get(
-            f"{BASE_URL}/samples/{sample_id}/behavioral1/report_triage.json",
-            headers=HEADERS
-        )
+        # tasks is a DICT keyed by full task id e.g. "20240101-abc123-behavioral1"
+        task_id = None
+        if isinstance(tasks_raw, dict):
+            for tid, tinfo in tasks_raw.items():
+                if tinfo.get("kind") == "behavioral":
+                    task_id = tid
+                    break
+        elif isinstance(tasks_raw, list):
+            for t in tasks_raw:
+                if t.get("kind") == "behavioral":
+                    task_id = t.get("id")
+                    break
 
-        if report_res.status_code != 200:
-            st.error(f"Failed to retrieve report (HTTP {report_res.status_code}): {report_res.text}")
+        if not task_id:
+            st.error("No behavioral task found in report.")
             st.stop()
 
-        report_data = report_res.json()
+        st.info(f"Task ID: `{task_id}`")
 
-        # Debug expander — remove once confirmed working
-        with st.expander("🔍 Raw Report Debug (remove after testing)"):
-            st.write("Top-level keys:", list(report_data.keys()))
-            if report_data.get("processes"):
-                st.write("First process keys:", list(report_data["processes"][0].keys()))
+        # ── STEP 4: FETCH onemon.json (raw kernel event log) ────────────────────
+        # This is where ALL api calls, dlls, mutexes actually live in Triage
+        with st.spinner("Downloading behavioral event log (onemon.json)..."):
+            onemon_res = requests.get(
+                f"{BASE_URL}/samples/{sample_id}/{task_id}/logs/onemon.json",
+                headers=HEADERS,
+                stream=True
+            )
 
-        # ── STEP 5: FEATURE EXTRACTION (matching Xran dataset format) ────────────
+        if onemon_res.status_code != 200:
+            st.error(f"Failed to fetch onemon.json (HTTP {onemon_res.status_code}): {onemon_res.text}")
+            st.stop()
+
+        # onemon.json is NDJSON — one JSON object per line
         raw_apis    = []
         raw_dlls    = []
         raw_mutexes = []
 
-        for proc in report_data.get("processes", []):
+        for line in onemon_res.iter_lines():
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-            # 500 API calls
-            for call in proc.get("calls", []):
-                api_name = call.get("api")
+            kind = event.get("kind", "")
+
+            # ── API CALLS ──────────────────────────────────────────────────────
+            # kind == "call" → event has "call" field with the API name
+            if kind == "call":
+                api_name = event.get("call")
                 if api_name:
                     raw_apis.append(api_name)
 
-            # 10 DLLs — correct field is "modules"
-            for mod in proc.get("modules", []):
-                if isinstance(mod, str):
-                    raw_dlls.append(mod)
-                elif isinstance(mod, dict):
-                    name = mod.get("basename") or mod.get("path", "")
-                    if name:
-                        raw_dlls.append(name.split("\\")[-1])
+            # ── LOADED DLLs ────────────────────────────────────────────────────
+            # kind == "load_image" → event has "image" field with the DLL path
+            elif kind == "load_image":
+                image_path = event.get("image", "")
+                if image_path:
+                    # Keep only the filename e.g. "kernel32.dll"
+                    dll_name = image_path.split("\\")[-1].split("/")[-1]
+                    if dll_name.lower().endswith(".dll"):
+                        raw_dlls.append(dll_name)
 
-            # 10 Mutexes — correct field is "mutants"
-            for mutant in proc.get("mutants", []):
-                if isinstance(mutant, str):
-                    raw_mutexes.append(mutant)
-                elif isinstance(mutant, dict):
-                    name = mutant.get("name", "")
-                    if name:
-                        raw_mutexes.append(name)
+            # ── MUTEXES ────────────────────────────────────────────────────────
+            # kind == "CreateMutant" OR kind == "mutex" depending on onemon version
+            elif kind in ("mutex", "CreateMutant") or (
+                kind == "call" and event.get("call", "").lower() in ("createmutexw", "createmutexexw", "ntcreatemutant")
+            ):
+                # Try direct name field first
+                mutex_name = event.get("name") or event.get("mutex")
+                if not mutex_name:
+                    # Fall back to args list
+                    args = event.get("args", [])
+                    if args:
+                        mutex_name = args[0] if isinstance(args[0], str) else None
+                if mutex_name:
+                    raw_mutexes.append(mutex_name)
 
+        # ── STEP 5: DEBUG ───────────────────────────────────────────────────────
         with st.expander("🔍 Extraction Debug"):
-            st.write(f"APIs extracted: {len(raw_apis)} (using first 500)")
-            st.write(f"DLLs extracted: {len(raw_dlls)} (using first 10)")
-            st.write(f"Mutexes extracted: {len(raw_mutexes)} (using first 10)")
-            st.write("Sample APIs:", raw_apis[:10])
-            st.write("Sample DLLs:", raw_dlls[:10])
+            st.write(f"APIs extracted: **{len(raw_apis)}** (using first 500)")
+            st.write(f"DLLs extracted: **{len(raw_dlls)}** (using first 10)")
+            st.write(f"Mutexes extracted: **{len(raw_mutexes)}** (using first 10)")
+            st.write("Sample APIs:",    raw_apis[:15])
+            st.write("Sample DLLs:",    raw_dlls[:10])
             st.write("Sample Mutexes:", raw_mutexes[:10])
 
-        # Build final sequence exactly matching Xran training format
+        # Build sequence matching Xran training format exactly
         final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
 
         if not final_sequence.strip():
-            st.error("Extracted sequence is empty — the malware may not have executed properly in the sandbox.")
+            st.error("Sequence is empty — the sample may not have executed or onemon had no events.")
             st.stop()
 
-        # ── STEP 6: LSTM PREDICTION ──────────────────────────────────────────────
+        # ── STEP 6: LSTM PREDICTION ─────────────────────────────────────────────
         def predict_proba(texts):
             seqs   = tokenizer.texts_to_sequences(texts)
             padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
@@ -297,7 +304,7 @@ with tab2:
         with col2:
             st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
 
-        # ── STEP 7: LIME EXPLANATION ─────────────────────────────────────────────
+        # ── STEP 7: LIME EXPLANATION ────────────────────────────────────────────
         with st.spinner("Generating LIME explanation..."):
             explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
             exp = explainer.explain_instance(
