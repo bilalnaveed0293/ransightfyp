@@ -132,8 +132,10 @@ with tab1:
                     messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}]}],
                 )
                 st.write(response.choices[0].message.content)
+# Note: This assumes `tab2`, `lstm_model`, and `tokenizer` are defined elsewhere in your main script!
 with tab2:
     st.header("Dynamic Analysis: Triage Sandbox & LIME Explainability")
+    st.markdown("This tab forces a controlled, standardized **60-second execution** for every sample to keep your research variables scientific and fair.")
     
     uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
@@ -142,33 +144,52 @@ with tab2:
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         MAX_LEN = 520
         
-        # 1. Submission
+        # 1. SUBMISSION
         with st.spinner("Uploading to Triage..."):
             files = {'file': (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            data = {"_json": '{"kind":"file","interactive":false,"profiles":[{"pk":"win10v2"}]}'}
+            
+            # Forces the sandbox VM to kill the file at exactly 60 seconds
+            data = {
+                "_json": '{"kind":"file","interactive":false,"profiles":[{"pk":"win10v2","timeout":60}]}'
+            }
+            
             res = requests.post("https://api.tria.ge/v0/samples", headers=HEADERS, files=files, data=data)
+            
+            if res.status_code not in [200, 201]:
+                st.error(f"Failed to submit file. API responded with code: {res.status_code}")
+                st.stop()
+                
             sample_id = res.json().get('id')
-            st.info(f"Sample ID: {sample_id} submitted to sandbox. Waiting for completion...")
+            st.info(f"Sample ID: {sample_id} submitted. Running test for 60 seconds...")
 
-        # 2. Polling for Completion (~2-3 mins)
+        # 2. POLLING FOR COMPLETION 
+        # Triage takes 60s to run + 15-30s to wrap up reports. 
+        # 20 steps * 5 seconds = 100 seconds max wait time.
         bar = st.progress(0)
         status = st.empty()
-        for i in range(30): 
-            time.sleep(10)
+        completed_on_time = False
+        
+        for i in range(20): 
+            time.sleep(5)
             check_res = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}", headers=HEADERS).json()
             
-            # FIX 1: Using 'status' instead of 'state'
             current_status = check_res.get('status', 'unknown')
-            bar.progress(int(min((i+1)*3.3, 100)))
-            status.text(f"Sandbox Status: {current_status}...")
             
-            # Triage moves from 'pending' -> 'running' -> 'completed'
+            # Safe progress bar math (converts float results to an exact integer)
+            bar.progress(int(min((i + 1) * 5, 100))) 
+            
+            status.text(f"Sandbox Status: {current_status} (Time elapsed: {(i+1)*5}s/100s)")
+            
             if current_status == 'completed': 
+                completed_on_time = True
                 break
-            
-        # 3. EXTRACTION: API, DLL, and Mutexes
+        
+        if not completed_on_time:
+            st.warning("⏱️ Reached the 100-second polling limit. Attempting to parse whatever data Triage has ready...")
+
+        # 3. FEATURE EXTRACTION
         with st.spinner("Extracting Behavioral Features..."):
-            # FIX 2: Correct endpoint is /summary
+            # Corrected endpoint targeting /summary
             summary_res = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}/summary", headers=HEADERS)
             
             if summary_res.status_code != 200:
@@ -183,9 +204,8 @@ with tab2:
                     name = call.get('api')
                     if name: api_calls.append(name)
             
-            # Safely grab DLLs and Mutexes at the global or process level
             extracted_dlls = summary.get('loaded_dlls', [])
-            extracted_mutexes = [m.get('name', '') for m in summary.get('mutexes', [])]
+            extracted_mutexes = [m.get('name', '') for m in summary.get('mutexes', []) if m.get('name')]
             
             # Fallback if top-level keys didn't catch them
             if not extracted_dlls or not extracted_mutexes:
@@ -193,23 +213,28 @@ with tab2:
                     if 'loaded_modules' in proc:
                         extracted_dlls.extend(proc.get('loaded_modules', []))
                     if 'mutexes' in proc:
-                        extracted_mutexes.extend(proc.get('mutexes', []))
+                        for m in proc.get('mutexes', []):
+                            if isinstance(m, dict):
+                                extracted_mutexes.append(m.get('name', ''))
+                            elif isinstance(m, str):
+                                extracted_mutexes.append(m)
 
-            # Combine them in a sequence just like your XRan paper architecture!
+            # Splicing sequences to exactly map to your 520 max length
             raw_sequence = " ".join((api_calls[:450] + extracted_dlls[:35] + extracted_mutexes[:35]))
 
-        # Final safety check
+        # Safety catch for blank results
         if not raw_sequence.strip():
             st.warning("No behavior captured by the script parser.")
             st.write("Debug - Available keys in Triage response:", list(summary.keys()))
             st.stop()
 
-        # 4. PREDICTION FUNCTION (Required for LIME)
+        # 4. PREDICTION FUNCTION FOR LIME
         def predict_proba_for_lime(texts):
             sequences = tokenizer.texts_to_sequences(texts)
             padded = pad_sequences(sequences, maxlen=MAX_LEN, padding='post', truncating='post')
             preds = lstm_model.predict(padded)
             
+            # Converts (N, 1) sigmoid predictions to (N, 2) required by LIME
             if preds.shape[1] == 1:
                 return np.hstack([1 - preds, preds])
             return preds
