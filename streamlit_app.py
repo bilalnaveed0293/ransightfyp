@@ -234,19 +234,90 @@ with tab2:
             st.error(f"Failed to fetch onemon.json (HTTP {onemon_res.status_code}): {onemon_res.text}")
             st.stop()
 
-        # ── STEP 7: DEBUG — print first 20 raw lines to see exact structure ─────
-        raw_lines = []
+        # ── STEP 7: PARSE onemon.json ────────────────────────────────────────────
+        # Real kind values from Triage: "onemon.Call", "onemon.Module", "onemon.Mutant"
+        raw_apis    = []
+        raw_dlls    = []
+        raw_mutexes = []
+
         for line in onemon_res.iter_lines():
-            if line:
-                raw_lines.append(line.decode("utf-8") if isinstance(line, bytes) else line)
-            if len(raw_lines) >= 20:
-                break
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        with st.expander("🔍 Raw onemon.json — first 20 lines (CRITICAL DEBUG)"):
-            if raw_lines:
-                for l in raw_lines:
-                    st.code(l, language="json")
-            else:
-                st.error("onemon.json is completely empty — sample did not execute in sandbox.")
+            kind = event.get("kind", "")
+            evt  = event.get("event", {})
 
-        st.stop()  # ← remove this once you paste the output and we fix the parser
+            # ── API CALLS → onemon.Call ────────────────────────────────────────
+            if kind == "onemon.Call":
+                # "symbol" is the API name e.g. "NtCreateFile", "RegSetValueExW"
+                api_name = evt.get("symbol") or evt.get("api") or evt.get("name")
+                if api_name:
+                    raw_apis.append(api_name)
+
+            # ── DLL LOADS → onemon.Module ──────────────────────────────────────
+            elif kind == "onemon.Module":
+                # "image" is the full path e.g. "C:\Windows\System32\kernel32.dll"
+                image_path = evt.get("image", "")
+                if image_path:
+                    dll_name = image_path.replace("\\", "/").split("/")[-1]
+                    if dll_name.lower().endswith(".dll"):
+                        raw_dlls.append(dll_name)
+
+            # ── MUTEXES → onemon.Mutant ────────────────────────────────────────
+            elif kind == "onemon.Mutant":
+                # "name" is the mutex name e.g. "Global\MyMutex"
+                name = evt.get("name", "")
+                if name:
+                    raw_mutexes.append(name)
+
+        # ── STEP 8: DEBUG ───────────────────────────────────────────────────────
+        with st.expander("🔍 Extraction Debug"):
+            st.write(f"APIs extracted: **{len(raw_apis)}** (using first 500)")
+            st.write(f"DLLs extracted: **{len(raw_dlls)}** (using first 10)")
+            st.write(f"Mutexes extracted: **{len(raw_mutexes)}** (using first 10)")
+            st.write("Sample APIs:",    raw_apis[:15])
+            st.write("Sample DLLs:",    raw_dlls[:10])
+            st.write("Sample Mutexes:", raw_mutexes[:10])
+
+        # Build sequence matching Xran training format exactly
+        final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+
+        if not final_sequence.strip():
+            st.error("Sequence is empty — sample may have evaded the sandbox (common with ransomware).")
+            st.stop()
+
+        # ── STEP 9: LSTM PREDICTION ─────────────────────────────────────────────
+        def predict_proba(texts):
+            seqs   = tokenizer.texts_to_sequences(texts)
+            padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
+            preds  = lstm_model.predict(padded)
+            if preds.shape[1] == 1:
+                return np.hstack([1 - preds, preds])
+            return preds
+
+        probs = predict_proba([final_sequence])[0]
+
+        st.divider()
+        if probs[1] > 0.5:
+            st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
+        else:
+            st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
+        with col2:
+            st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
+
+        # ── STEP 10: LIME EXPLANATION ───────────────────────────────────────────
+        with st.spinner("Generating LIME explanation..."):
+            explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
+            exp = explainer.explain_instance(
+                final_sequence, predict_proba, num_features=10
+            )
+            st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
+            components.html(exp.as_html(), height=600, scrolling=True)
