@@ -132,91 +132,69 @@ with tab1:
                     messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}]}],
                 )
                 st.write(response.choices[0].message.content)
-
-# ==================================================================
-# TAB 2: DYNAMIC ANALYSIS (LSTM + Hybrid Analysis API)
-# ==================================================================
+# --- TAB 2: DYNAMIC ANALYSIS (TRIAGE) ---
 with tab2:
-    st.header("Dynamic Analysis: Cloud Sandbox Detonation")
-    st.info("Files are sent to Hybrid Analysis (CrowdStrike) for safe execution.")
+    st.header("Dynamic Analysis: Triage Sandbox")
+    
+    uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
-    uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Detonation", type=["exe"], key="u2")
-    MAX_LEN = 520
-
-    if uploaded_dynamic and st.button("Start Cloud Analysis"):
-        # Force it to be a string and strip off any invisible newlines or spaces!
-        HA_KEY = str(st.secrets["HYBRID_ANALYSIS_API_KEY"]).strip()
-        HEADERS = {'api-key': HA_KEY, 'user-agent': 'Falcon Sandbox'}
+    if uploaded_dynamic and st.button("Start Analysis"):
+        API_KEY = st.secrets["TRIAGE_API_KEY"]
+        HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         
-       # 1. Submission
-        with st.spinner("Uploading to Hybrid Analysis..."):
-            files = {'file': (uploaded_dynamic.name, uploaded_dynamic.read())}
-            res = requests.post("https://www.hybrid-analysis.com/api/v2/submit/file", headers=HEADERS, files=files, data={'environment_id': 160})
-            
-            # --- NEW DEBUGGING LOGIC ---
-            try:
-                res_json = res.json()
-            except Exception:
-                st.error(f"Server returned a raw error. HTTP Status Code: {res.status_code}")
-                st.stop()
-                
-            job_id = res_json.get('job_id')
-            if not job_id: 
-                st.error(f"Upload failed! Hybrid Analysis returned this message: {res_json}")
-                st.stop()
+        # 1. Submission
+        with st.spinner("Uploading to Triage..."):
+            files = {'file': (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
+            # 'interactive': false runs it automatically
+            data = {"_json": '{"kind":"file","interactive":false,"profiles":[{"pk":"win10v2"}]}'}
+            res = requests.post("https://api.tria.ge/v0/samples", headers=HEADERS, files=files, data=data)
+            sample_id = res.json().get('id')
+            st.info(f"Sample ID: {sample_id} is now in the sandbox.")
 
-        # 2. Polling
+        # 2. The Waiting Room (Polling)
         bar = st.progress(0)
-        status_text = st.empty()
-        for i in range(40): # Poll for ~10 mins
-            time.sleep(15)
-            state = requests.get(f"https://www.hybrid-analysis.com/api/v2/report/{job_id}/state", headers=HEADERS).json()
-            bar.progress(min((i+1)*3, 100))
-            status_text.text(f"Sandbox State: {state.get('state')}")
-            if state.get('state') == 'SUCCESS': break
+        status = st.empty()
+        for i in range(25): # Poll for ~4 mins
+            time.sleep(10)
+            check = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}", headers=HEADERS).json()
+            state = check.get('state')
+            bar.progress(min((i+1)*4, 100))
+            status.text(f"Sandbox State: {state}...")
+            if state == 'reported': break
         
-        # 3. Extraction
-        with st.spinner("Parsing API Traces..."):
-            report = requests.get(f"https://www.hybrid-analysis.com/api/v2/report/{job_id}/summary", headers=HEADERS).json()
+        # 3. API Sequence Extraction
+        with st.spinner("Extracting API Call Sequence..."):
+            # Fetch summary to find the Task ID
+            summary = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}/reports/summary", headers=HEADERS).json()
             
-            apis = [c.get('name') for p in report.get('processes', []) for c in p.get('calls', [])]
-            dlls = report.get('dll_loaded', [])
-            mutexes = report.get('mutex_created', [])
+            api_calls = []
+            # We iterate through captured processes
+            for proc in summary.get('processes', []):
+                for call in proc.get('calls', []):
+                    name = call.get('api')
+                    if name: api_calls.append(name)
             
-            trace_input = " ".join((apis[:500] + dlls[:10] + mutexes[:10]))
-            if not trace_input.strip(): trace_input = "LdrLoadDll RegOpenKeyExW NtCreateFile PRF PRF PRF PRF kernel32.dll" # Fallback
+            # Prepare sequence for LSTM
+            raw_sequence = " ".join(api_calls[:520]) # Limit to your model's MAX_LEN
 
-        # 4. Prediction
-        def predict_p(txt):
-            seq = tokenizer.texts_to_sequences(txt)
-            pad = pad_sequences(seq, maxlen=MAX_LEN, padding='post')
-            preds = lstm_model.predict(pad)
-            return np.hstack((1-preds, preds))
-
-        prob_dynamic = predict_p([trace_input])[0][1]
-        st.divider()
-        if prob_dynamic > 0.5:
-            st.error(f"Dynamic Verdict: RANSOMWARE ({prob_dynamic*100:.1f}%)")
+        # 4. LSTM Prediction
+        if raw_sequence:
+            # Preprocessing
+            seq = tokenizer.texts_to_sequences([raw_sequence])
+            padded = pad_sequences(seq, maxlen=520, padding='post')
+            
+            prediction = lstm_model.predict(padded)[0][0]
+            
+            st.divider()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if prediction > 0.5:
+                    st.error(f"VERDICT: RANSOMWARE ({prediction*100:.1f}%)")
+                else:
+                    st.success(f"VERDICT: BENIGN ({(1-prediction)*100:.1f}%)")
+            
+            with col_b:
+                st.write("**Captured API Sequence (Partial):**")
+                st.caption(raw_sequence[:300] + "...")
         else:
-            st.success(f"Dynamic Verdict: BENIGN ({(1-prob_dynamic)*100:.1f}%)")
-
-        # 5. XAI (SHAP & LIME)
-        c_lime, c_shap = st.columns(2)
-        with c_lime:
-            st.subheader("LIME Explanation")
-            explainer = LimeTextExplainer(class_names=['Benign', 'Ransomware'])
-            exp = explainer.explain_instance(trace_input, predict_p, num_features=8)
-            st.pyplot(exp.as_pyplot_figure())
-
-        with c_shap:
-            st.subheader("SHAP Feature Impact")
-            def shap_p(d): return lstm_model.predict(d).flatten()
-            explainer_shap = shap.KernelExplainer(shap_p, np.zeros((5, MAX_LEN)))
-            test_seq = pad_sequences(tokenizer.texts_to_sequences([trace_input]), maxlen=MAX_LEN)
-            sv = explainer_shap.shap_values(test_seq)
-            
-            names = [tokenizer.index_word.get(i, "?") for i in test_seq[0] if i != 0][:10]
-            vals = sv[0][:len(names)]
-            fig, ax = plt.subplots()
-            ax.barh(names, vals, color=['red' if v > 0 else 'blue' for v in vals])
-            st.pyplot(fig)
+            st.warning("No behavior captured. Malware might be sandbox-aware.")
