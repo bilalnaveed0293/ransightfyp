@@ -153,34 +153,40 @@ with tab2:
             sample_id = res.get('id')
             st.info(f"Sample ID: {sample_id} submitted. Waiting for 60s execution + reporting...")
 
-        # 2. POLLING (Wait up to 100s for execution + report generation)
+# 2. POLLING (Layer 1: Sample Level)
         bar = st.progress(0)
         status_text = st.empty()
-        completed = False
         
-        for i in range(20): # 20 * 5s = 100s
+        for i in range(25): # Increased to 125s to be safe
             time.sleep(5)
             check = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
             curr_status = check.get('status', 'unknown')
             
-            bar.progress(int(min((i + 1) * 5, 100)))
-            status_text.text(f"Status: {curr_status} ({ (i+1)*5 }s/100s)")
+            bar.progress(int(min((i + 1) * 4, 100)))
+            status_text.text(f"Sample Status: {curr_status} ({ (i+1)*5 }s/125s)")
             
             if curr_status == 'reported':
-                completed = True
                 break
-        
-        if not completed:
-            st.warning("Analysis taking longer than expected. Attempting to fetch partial logs...")
 
-        # 3. GET TASK & BEHAVIORAL REPORT
+        # 3. POLLING (Layer 2: Task Level - Fixes the 404)
         sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
         tasks = sample_info.get('tasks', [])
+        
         if not tasks:
-            st.error("No behavioral tasks found.")
+            st.error("No behavioral tasks were created.")
             st.stop()
             
         task_id = tasks[0].get('id')
+        
+        # New loop: Wait until the TASK specifically is 'reported'
+        with st.spinner("Finalizing behavioral logs..."):
+            for _ in range(10): 
+                task_check = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}", headers=HEADERS).json()
+                if task_check.get('status') == 'reported':
+                    break
+                time.sleep(3)
+
+        # 4. FETCH THE JSON (Now safe from 404)
         report_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}/report_triage.json", headers=HEADERS)
         
         if report_res.status_code == 200:
