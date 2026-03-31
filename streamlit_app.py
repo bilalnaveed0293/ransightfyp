@@ -136,6 +136,11 @@ with tab2:
     if uploaded_dynamic and st.button("Start Full Analysis"):
         import streamlit.components.v1 as components
         import json
+        import time
+        import requests
+        import numpy as np
+        from lime.lime_text import LimeTextExplainer
+        # Assuming tokenizer and pad_sequences are already imported at the top of your script
 
         API_KEY = st.secrets["TRIAGE_API_KEY"]
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
@@ -187,18 +192,16 @@ with tab2:
                 break
 
         if curr_status == "failed":
-            st.error("Triage analysis failed.")
+            st.error("Triage analysis failed. The sample may be corrupted or unsupported.")
             st.stop()
         if curr_status != "reported":
             st.warning("Triage timed out.")
             st.stop()
 
         # ── STEP 4: GET FULL TASK IDs FROM SAMPLE RESPONSE ──────────────────────
-        # CRITICAL FIX: full task id is "{sample_id}-behavioral1" not just "behavioral1"
         sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
         tasks_raw   = sample_info.get("tasks", {})
 
-        # tasks can be a dict keyed by full task id, or a list with "id" field
         behavioral_tasks = []
         if isinstance(tasks_raw, dict):
             for full_tid, tinfo in tasks_raw.items():
@@ -207,9 +210,9 @@ with tab2:
         elif isinstance(tasks_raw, list):
             for t in tasks_raw:
                 tid = t.get("id", "")
-                # short ids like "behavioral1" → expand to full id
                 if tid.startswith("behavioral"):
-                    full_tid = f"{sample_id}-{tid}"
+                    # Use standard fallback if short ID is provided
+                    full_tid = f"{sample_id}-{tid}" if "-" not in tid else tid
                     behavioral_tasks.append(full_tid)
 
         if not behavioral_tasks:
@@ -227,7 +230,7 @@ with tab2:
         for full_task_id in behavioral_tasks:
             st.info(f"Fetching onemon.json for task `{full_task_id}`...")
 
-            # Wait for task to be reported
+            # Wait for specific task to be reported
             for _ in range(20):
                 task_chk = requests.get(
                     f"{BASE_URL}/samples/{sample_id}/{full_task_id}",
@@ -238,7 +241,6 @@ with tab2:
                         break
                 time.sleep(5)
 
-            # Fetch onemon.json with full task id in URL
             onemon_res = requests.get(
                 f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json",
                 headers=HEADERS,
@@ -246,8 +248,16 @@ with tab2:
             )
 
             if onemon_res.status_code != 200:
-                st.warning(f"onemon.json returned {onemon_res.status_code} for `{full_task_id}` — trying next...")
-                continue
+                # If full_task_id fails, sometimes Triage just uses the short ID (e.g., 'behavioral1')
+                short_id = full_task_id.split("-")[-1]
+                onemon_res = requests.get(
+                    f"{BASE_URL}/samples/{sample_id}/{short_id}/logs/onemon.json",
+                    headers=HEADERS,
+                    stream=True
+                )
+                if onemon_res.status_code != 200:
+                    st.warning(f"onemon.json returned {onemon_res.status_code} for `{full_task_id}` — trying next...")
+                    continue
 
             # Parse NDJSON
             kind_counts  = {}
@@ -269,23 +279,24 @@ with tab2:
 
                 # API calls
                 if kind == "onemon.Call":
-                    api_name = evt.get("symbol") or evt.get("api") or evt.get("name")
+                    api_name = evt.get("api") or evt.get("symbol") or evt.get("name")
                     if api_name:
                         task_apis.append(api_name)
 
                 # DLL loads
-                elif kind == "onemon.Module":
-                    image_path = evt.get("image", "")
+                elif kind in ("onemon.Module", "onemon.ImageLoad"):
+                    image_path = evt.get("filepath") or evt.get("image") or ""
                     if image_path:
                         dll_name = image_path.replace("\\", "/").split("/")[-1]
                         if dll_name.lower().endswith(".dll"):
                             task_dlls.append(dll_name)
 
-                # Mutexes
-                elif kind == "onemon.Mutant":
-                    name = evt.get("name", "")
-                    if name:
-                        task_mutexes.append(name)
+                # Mutexes (CRITICAL FIX: Triage maps Mutexes to Handle -> type: Mutant)
+                elif kind == "onemon.Handle":
+                    if evt.get("type") == "Mutant":
+                        name = evt.get("name", "")
+                        if name:
+                            task_mutexes.append(name)
 
             with st.expander(f"🔍 Kind counts for `{full_task_id}`"):
                 st.json(kind_counts)
@@ -295,12 +306,12 @@ with tab2:
                 raw_dlls    = task_dlls
                 raw_mutexes = task_mutexes
                 successful_task = full_task_id
-                st.success(f"✅ Got behavioral data from `{full_task_id}`")
+                st.success(f"✅ Got behavioral data from task: `{full_task_id}`")
                 break
             else:
                 st.warning(f"No API/DLL data in `{full_task_id}` — trying next task...")
 
-        # ── STEP 6: DEBUG ───────────────────────────────────────────────────────
+        # ── STEP 6: DEBUG & SEQUENCE PREPARATION ────────────────────────────────
         with st.expander("🔍 Extraction Summary"):
             st.write(f"Successful task: `{successful_task}`")
             st.write(f"APIs: **{len(raw_apis)}** | DLLs: **{len(raw_dlls)}** | Mutexes: **{len(raw_mutexes)}**")
@@ -308,10 +319,11 @@ with tab2:
             st.write("Sample DLLs:",    raw_dlls[:10])
             st.write("Sample Mutexes:", raw_mutexes[:10])
 
+        # Enforce exact length constraints
         final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
 
         if not final_sequence.strip():
-            st.error("All behavioral tasks returned empty data. Check kind counts above — if onemon.Call is missing, this sample evaded the kernel driver.")
+            st.error("All behavioral tasks returned empty data. If `onemon.Call` is missing in the counts above, this sample evaded the kernel driver.")
             st.stop()
 
         # ── STEP 7: LSTM PREDICTION ─────────────────────────────────────────────
@@ -319,6 +331,7 @@ with tab2:
             seqs   = tokenizer.texts_to_sequences(texts)
             padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
             preds  = lstm_model.predict(padded)
+            # Ensure output is in [Prob_Benign, Prob_Ransomware] format for LIME
             if preds.shape[1] == 1:
                 return np.hstack([1 - preds, preds])
             return preds
