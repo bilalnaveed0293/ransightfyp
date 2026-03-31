@@ -166,7 +166,7 @@ with tab2:
                 data=json.dumps({"auto": True})
             )
             if profile_res.status_code not in (200, 201, 409):
-                st.warning(f"Profile auto-select returned {profile_res.status_code}: {profile_res.text} — continuing anyway...")
+                st.warning(f"Profile auto-select returned {profile_res.status_code}: {profile_res.text}")
             else:
                 st.info("✅ Profile selected — behavioral analysis starting...")
 
@@ -198,7 +198,6 @@ with tab2:
         sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
         tasks_raw   = sample_info.get("tasks", [])
 
-        # tasks is a LIST — pick first entry whose id starts with "behavioral"
         task_id = None
         for t in tasks_raw:
             if t.get("id", "").startswith("behavioral"):
@@ -222,17 +221,7 @@ with tab2:
                     if task_chk.json().get("status") == "reported":
                         break
                 time.sleep(5)
-        # ── DEBUG: List all available files for this task ───────────────────────
-        # Use this to check if 'report_triage.json' is listed in the output
-        files_res = requests.get(
-            f"{BASE_URL}/samples/{sample_id}/{task_id}/files",
-            headers=HEADERS
-        )
-        with st.expander("🔍 Available task files (debug)"):
-            if files_res.status_code == 200:
-                st.json(files_res.json())
-            else:
-                st.error(f"Could not fetch file list. Status: {files_res.status_code}")
+
         # ── STEP 6: FETCH onemon.json ───────────────────────────────────────────
         with st.spinner("Downloading behavioral event log..."):
             onemon_res = requests.get(
@@ -245,101 +234,19 @@ with tab2:
             st.error(f"Failed to fetch onemon.json (HTTP {onemon_res.status_code}): {onemon_res.text}")
             st.stop()
 
-        # ── STEP 7: PARSE onemon.json (NDJSON — one event per line) ─────────────
-        raw_apis    = []
-        raw_dlls    = []
-        raw_mutexes = []
-
+        # ── STEP 7: DEBUG — print first 20 raw lines to see exact structure ─────
+        raw_lines = []
         for line in onemon_res.iter_lines():
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            if line:
+                raw_lines.append(line.decode("utf-8") if isinstance(line, bytes) else line)
+            if len(raw_lines) >= 20:
+                break
 
-            kind = event.get("kind", "")
+        with st.expander("🔍 Raw onemon.json — first 20 lines (CRITICAL DEBUG)"):
+            if raw_lines:
+                for l in raw_lines:
+                    st.code(l, language="json")
+            else:
+                st.error("onemon.json is completely empty — sample did not execute in sandbox.")
 
-            # API calls
-            if kind == "call":
-                api_name = event.get("call")
-                if api_name:
-                    raw_apis.append(api_name)
-
-            # DLL loads
-            elif kind == "load_image":
-                image_path = event.get("image", "")
-                if image_path:
-                    dll_name = image_path.replace("\\", "/").split("/")[-1]
-                    if dll_name.lower().endswith(".dll"):
-                        raw_dlls.append(dll_name)
-
-            # Mutexes — dedicated event
-            elif kind in ("mutex", "CreateMutant"):
-                name = event.get("name") or event.get("mutex", "")
-                if name:
-                    raw_mutexes.append(name)
-
-            # Mutexes — captured inside API call events
-            elif kind == "call" and event.get("call", "").lower() in (
-                "ntcreatemutant", "createmutexw", "createmutexexw", "createmutexexa"
-            ):
-                args = event.get("args", [])
-                name = None
-                for arg in args:
-                    if isinstance(arg, dict) and arg.get("name") in ("MutexName", "lpName"):
-                        name = arg.get("value")
-                        break
-                    elif isinstance(arg, str) and arg:
-                        name = arg
-                        break
-                if name:
-                    raw_mutexes.append(name)
-
-        # ── STEP 8: DEBUG ───────────────────────────────────────────────────────
-        with st.expander("🔍 Extraction Debug"):
-            st.write(f"APIs extracted: **{len(raw_apis)}** (using first 500)")
-            st.write(f"DLLs extracted: **{len(raw_dlls)}** (using first 10)")
-            st.write(f"Mutexes extracted: **{len(raw_mutexes)}** (using first 10)")
-            st.write("Sample APIs:",    raw_apis[:15])
-            st.write("Sample DLLs:",    raw_dlls[:10])
-            st.write("Sample Mutexes:", raw_mutexes[:10])
-
-        # Build sequence matching Xran training format exactly
-        final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
-
-        if not final_sequence.strip():
-            st.error("Sequence is empty — the sample may not have executed or onemon had no events.")
-            st.stop()
-
-        # ── STEP 9: LSTM PREDICTION ─────────────────────────────────────────────
-        def predict_proba(texts):
-            seqs   = tokenizer.texts_to_sequences(texts)
-            padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
-            preds  = lstm_model.predict(padded)
-            if preds.shape[1] == 1:
-                return np.hstack([1 - preds, preds])
-            return preds
-
-        probs = predict_proba([final_sequence])[0]
-
-        st.divider()
-        if probs[1] > 0.5:
-            st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
-        else:
-            st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
-        with col2:
-            st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
-
-        # ── STEP 10: LIME EXPLANATION ───────────────────────────────────────────
-        with st.spinner("Generating LIME explanation..."):
-            explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
-            exp = explainer.explain_instance(
-                final_sequence, predict_proba, num_features=10
-            )
-            st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
-            components.html(exp.as_html(), height=600, scrolling=True)
+        st.stop()  # ← remove this once you paste the output and we fix the parser
