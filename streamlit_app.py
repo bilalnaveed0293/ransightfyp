@@ -135,108 +135,181 @@ with tab1:
 with tab2:
     st.header("Dynamic Analysis: Triage Sandbox & LIME")
     st.markdown("Standardized **60-second execution**. Extracting 500 APIs, 10 DLLs, and 10 Mutexes.")
-    
+
     uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
     if uploaded_dynamic and st.button("Start Full Analysis"):
+        import streamlit.components.v1 as components  # ← was missing from tab2 scope
+
         API_KEY = st.secrets["TRIAGE_API_KEY"]
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         BASE_URL = "https://api.tria.ge/v0"
-        
-        # 1. SUBMISSION WITH 60s TIMEOUT
-        with st.spinner("Uploading to Triage..."):
-            files = {'file': (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            # Setting a strict 60s timeout in the profile
-            data = {"_json": '{"kind":"file","interactive":false,"profiles":[{"pk":"win10v2","timeout":60}]}'}
-            
-            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data).json()
-            sample_id = res.get('id')
-            st.info(f"Sample ID: {sample_id} submitted. Waiting for 60s execution + reporting...")
 
-# 2. POLLING (Layer 1: Sample Level)
+        # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
+        with st.spinner("Uploading to Triage sandbox..."):
+            files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
+            # FIX: correct profile key is "profile" not "pk"
+            data = {
+                "_json": '{"kind":"file","interactive":false,"profiles":[{"profile":"win10","timeout":60}]}'
+            }
+            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
+
+            if res.status_code not in (200, 201):
+                st.error(f"Submission failed ({res.status_code}): {res.text}")
+                st.stop()
+
+            sample_id = res.json().get("id")
+            if not sample_id:
+                st.error(f"No sample ID returned. Response: {res.json()}")
+                st.stop()
+
+            st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for 60s execution + reporting...")
+
+        # ── STEP 2: POLL SAMPLE STATUS (up to 5 minutes) ────────────────────────
         bar = st.progress(0)
         status_text = st.empty()
-        
-        for i in range(25): # Increased to 125s to be safe
+        MAX_WAIT = 60   # iterations × 5s = 300s
+        curr_status = "pending"
+
+        for i in range(MAX_WAIT):
             time.sleep(5)
-            check = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
-            curr_status = check.get('status', 'unknown')
-            
-            bar.progress(int(min((i + 1) * 4, 100)))
-            status_text.text(f"Sample Status: {curr_status} ({ (i+1)*5 }s/125s)")
-            
-            if curr_status == 'reported':
+            check = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
+            if check.status_code != 200:
+                continue
+            curr_status = check.json().get("status", "unknown")
+            bar.progress(int(min((i + 1) / MAX_WAIT * 100, 100)))
+            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_WAIT*5}s)")
+            if curr_status in ("reported", "failed"):
                 break
 
-        # 3. POLLING (Layer 2: Task Level - Fixes the 404)
-        sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
-        tasks = sample_info.get('tasks', [])
-        
-        if not tasks:
-            st.error("No behavioral tasks were created.")
+        if curr_status == "failed":
+            st.error("Triage analysis failed. The sample may have crashed or been rejected.")
             st.stop()
-            
-        task_id = tasks[0].get('id')
-        
-        # New loop: Wait until the TASK specifically is 'reported'
+
+        if curr_status != "reported":
+            st.warning("Triage did not finish in time. Try fetching the report manually.")
+            st.stop()
+
+        # ── STEP 3: GET TASK ID ──────────────────────────────────────────────────
+        # FIX: tasks is a DICT keyed by task_id, not a list
+        sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+        tasks_dict = sample_info.get("tasks", {})
+
+        if not tasks_dict:
+            st.error("No behavioral tasks found in the report.")
+            st.stop()
+
+        # Pick the first behavioral task
+        task_id = None
+        for tid, tinfo in tasks_dict.items():
+            if tinfo.get("kind") == "behavioral":
+                task_id = tid
+                break
+
+        if not task_id:
+            task_id = list(tasks_dict.keys())[0]  # fallback: first task
+
+        st.info(f"Task ID: `{task_id}`")
+
+        # ── STEP 4: WAIT FOR TASK-LEVEL REPORT ──────────────────────────────────
         with st.spinner("Finalizing behavioral logs..."):
-            for _ in range(10): 
-                task_check = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}", headers=HEADERS).json()
-                if task_check.get('status') == 'reported':
-                    break
-                time.sleep(3)
+            for _ in range(20):
+                task_check = requests.get(
+                    f"{BASE_URL}/samples/{sample_id}/{task_id}", headers=HEADERS
+                )
+                if task_check.status_code == 200:
+                    if task_check.json().get("status") == "reported":
+                        break
+                time.sleep(5)
 
-        # 4. FETCH THE JSON (Now safe from 404)
-        report_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}/report_triage.json", headers=HEADERS)
-        
-        if report_res.status_code == 200:
-            report_data = report_res.json()
-            
-            # --- FEATURE EXTRACTION (STRICT ORDERING) ---
-            raw_apis = []
-            raw_dlls = []
-            raw_mutexes = []
-            
-            for proc in report_data.get('processes', []):
-                # 500 APIs
-                for call in proc.get('calls', []):
-                    api_name = call.get('api')
-                    if api_name: raw_apis.append(api_name)
-                
-                # 10 DLLs
-                for mod in proc.get('loaded_modules', []):
-                    raw_dlls.append(mod if isinstance(mod, str) else mod.get('basename', ''))
-                
-                # 10 Mutexes
-                for m in proc.get('mutexes', []):
-                    raw_mutexes.append(m if isinstance(m, str) else m.get('name', ''))
+        # ── STEP 5: FETCH BEHAVIORAL JSON REPORT ────────────────────────────────
+        report_res = requests.get(
+            f"{BASE_URL}/samples/{sample_id}/{task_id}/report_triage.json",
+            headers=HEADERS,
+        )
 
-            # Slice strictly according to your model requirements
-            final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+        if report_res.status_code != 200:
+            st.error(f"Failed to retrieve report (HTTP {report_res.status_code}): {report_res.text}")
+            st.stop()
 
-            # 4. PREDICTION
-            def predict_proba(texts):
-                seqs = tokenizer.texts_to_sequences(texts)
-                padded = pad_sequences(seqs, maxlen=520, padding='post', truncating='post')
-                preds = lstm_model.predict(padded)
-                return np.hstack([1 - preds, preds]) if preds.shape[1] == 1 else preds
+        report_data = report_res.json()
 
-            if final_sequence.strip():
-                probs = predict_proba([final_sequence])[0]
-                
-                st.divider()
-                if probs[1] > 0.5:
-                    st.error(f"🔥 VERDICT: RANSOMWARE ({probs[1]*100:.2f}%)")
-                else:
-                    st.success(f"🛡️ VERDICT: BENIGN ({probs[0]*100:.2f}%)")
+        # ── STEP 6: FEATURE EXTRACTION (matching Xran dataset format) ───────────
+        raw_apis    = []
+        raw_dlls    = []
+        raw_mutexes = []
 
-                # 5. LIME EXPLANATION
-                with st.spinner("Generating LIME analysis..."):
-                    explainer = LimeTextExplainer(class_names=['Benign', 'Ransomware'])
-                    exp = explainer.explain_instance(final_sequence, predict_proba, num_features=10)
-                    st.write("### 🧠 Feature Importance (API/DLL/Mutex)")
-                    components.html(exp.as_html(), height=600, scrolling=True)
-            else:
-                st.error("Extracted sequence is empty. Check if the malware ran in the sandbox.")
+        for proc in report_data.get("processes", []):
+
+            # 500 API calls — field: calls[].api
+            for call in proc.get("calls", []):
+                api_name = call.get("api")
+                if api_name:
+                    raw_apis.append(api_name)
+
+            # 10 DLLs — field: modules[].basename  (NOT loaded_modules)
+            for mod in proc.get("modules", []):
+                if isinstance(mod, str):
+                    raw_dlls.append(mod)
+                elif isinstance(mod, dict):
+                    name = mod.get("basename") or mod.get("path", "")
+                    if name:
+                        raw_dlls.append(name.split("\\")[-1])  # keep filename only
+
+            # 10 Mutexes — field: mutants[].name  (NOT mutexes, NOT inside calls)
+            for mutant in proc.get("mutants", []):
+                if isinstance(mutant, str):
+                    raw_mutexes.append(mutant)
+                elif isinstance(mutant, dict):
+                    name = mutant.get("name", "")
+                    if name:
+                        raw_mutexes.append(name)
+
+        # Debug expander — helps verify extraction is working
+        with st.expander("🔍 Raw Extraction Debug"):
+            st.write(f"APIs extracted: {len(raw_apis)} (using first 500)")
+            st.write(f"DLLs extracted: {len(raw_dlls)} (using first 10)")
+            st.write(f"Mutexes extracted: {len(raw_mutexes)} (using first 10)")
+            st.write("Sample APIs:", raw_apis[:10])
+            st.write("Sample DLLs:", raw_dlls[:10])
+            st.write("Sample Mutexes:", raw_mutexes[:10])
+
+        # Build sequence exactly matching Xran training format
+        final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+
+        if not final_sequence.strip():
+            st.error("Extracted sequence is empty — the malware may not have executed in the sandbox.")
+            st.stop()
+
+        # ── STEP 7: LSTM PREDICTION ──────────────────────────────────────────────
+        def predict_proba(texts):
+            seqs   = tokenizer.texts_to_sequences(texts)
+            padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
+            preds  = lstm_model.predict(padded)
+            # Handle both binary (shape [N,1]) and softmax (shape [N,2]) outputs
+            if preds.shape[1] == 1:
+                return np.hstack([1 - preds, preds])
+            return preds
+
+        probs = predict_proba([final_sequence])[0]
+
+        st.divider()
+        if probs[1] > 0.5:
+            st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
         else:
-            st.error(f"Failed to retrieve JSON report. Status: {report_res.status_code}")
+            st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
+        with col2:
+            st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
+
+        # ── STEP 8: LIME EXPLANATION ─────────────────────────────────────────────
+        with st.spinner("Generating LIME explanation..."):
+            explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
+            exp = explainer.explain_instance(
+                final_sequence, predict_proba, num_features=10
+            )
+            st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
+            components.html(exp.as_html(), height=600, scrolling=True)
