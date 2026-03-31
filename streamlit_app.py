@@ -132,69 +132,111 @@ with tab1:
                     messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}]}],
                 )
                 st.write(response.choices[0].message.content)
-# --- TAB 2: DYNAMIC ANALYSIS (TRIAGE) ---
 with tab2:
-    st.header("Dynamic Analysis: Triage Sandbox")
+    st.header("Dynamic Analysis: Triage Sandbox & LIME Explainability")
     
     uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
-    if uploaded_dynamic and st.button("Start Analysis"):
+    if uploaded_dynamic and st.button("Start Full Analysis"):
         API_KEY = st.secrets["TRIAGE_API_KEY"]
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+        MAX_LEN = 520
         
         # 1. Submission
         with st.spinner("Uploading to Triage..."):
             files = {'file': (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            # 'interactive': false runs it automatically
             data = {"_json": '{"kind":"file","interactive":false,"profiles":[{"pk":"win10v2"}]}'}
             res = requests.post("https://api.tria.ge/v0/samples", headers=HEADERS, files=files, data=data)
             sample_id = res.json().get('id')
-            st.info(f"Sample ID: {sample_id} is now in the sandbox.")
+            st.info(f"Sample ID: {sample_id} submitted to sandbox. Waiting for completion...")
 
-        # 2. The Waiting Room (Polling)
+        # 2. Polling for Completion (~2-3 mins)
         bar = st.progress(0)
         status = st.empty()
-        for i in range(25): # Poll for ~4 mins
+        for i in range(30): 
             time.sleep(10)
-            check = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}", headers=HEADERS).json()
-            state = check.get('state')
-            bar.progress(min((i+1)*4, 100))
-            status.text(f"Sandbox State: {state}...")
-            if state == 'reported': break
-        
-        # 3. API Sequence Extraction
-        with st.spinner("Extracting API Call Sequence..."):
-            # Fetch summary to find the Task ID
-            summary = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}/reports/summary", headers=HEADERS).json()
+            check_res = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}", headers=HEADERS).json()
+            
+            # FIX 1: Using 'status' instead of 'state'
+            current_status = check_res.get('status', 'unknown')
+            bar.progress(min((i+1)*3.3, 100))
+            status.text(f"Sandbox Status: {current_status}...")
+            
+            # Triage moves from 'pending' -> 'running' -> 'completed'
+            if current_status == 'completed': 
+                break
+            
+        # 3. EXTRACTION: API, DLL, and Mutexes
+        with st.spinner("Extracting Behavioral Features..."):
+            # FIX 2: Correct endpoint is /summary
+            summary_res = requests.get(f"https://api.tria.ge/v0/samples/{sample_id}/summary", headers=HEADERS)
+            
+            if summary_res.status_code != 200:
+                st.error(f"Failed to fetch summary. Status code: {summary_res.status_code}")
+                st.stop()
+                
+            summary = summary_res.json()
             
             api_calls = []
-            # We iterate through captured processes
             for proc in summary.get('processes', []):
                 for call in proc.get('calls', []):
                     name = call.get('api')
                     if name: api_calls.append(name)
             
-            # Prepare sequence for LSTM
-            raw_sequence = " ".join(api_calls[:520]) # Limit to your model's MAX_LEN
-
-        # 4. LSTM Prediction
-        if raw_sequence:
-            # Preprocessing
-            seq = tokenizer.texts_to_sequences([raw_sequence])
-            padded = pad_sequences(seq, maxlen=520, padding='post')
+            # Safely grab DLLs and Mutexes at the global or process level
+            extracted_dlls = summary.get('loaded_dlls', [])
+            extracted_mutexes = [m.get('name', '') for m in summary.get('mutexes', [])]
             
-            prediction = lstm_model.predict(padded)[0][0]
+            # Fallback if top-level keys didn't catch them
+            if not extracted_dlls or not extracted_mutexes:
+                for proc in summary.get('processes', []):
+                    if 'loaded_modules' in proc:
+                        extracted_dlls.extend(proc.get('loaded_modules', []))
+                    if 'mutexes' in proc:
+                        extracted_mutexes.extend(proc.get('mutexes', []))
+
+            # Combine them in a sequence just like your XRan paper architecture!
+            raw_sequence = " ".join((api_calls[:450] + extracted_dlls[:35] + extracted_mutexes[:35]))
+
+        # Final safety check
+        if not raw_sequence.strip():
+            st.warning("No behavior captured by the script parser.")
+            st.write("Debug - Available keys in Triage response:", list(summary.keys()))
+            st.stop()
+
+        # 4. PREDICTION FUNCTION (Required for LIME)
+        def predict_proba_for_lime(texts):
+            sequences = tokenizer.texts_to_sequences(texts)
+            padded = pad_sequences(sequences, maxlen=MAX_LEN, padding='post', truncating='post')
+            preds = lstm_model.predict(padded)
+            
+            if preds.shape[1] == 1:
+                return np.hstack([1 - preds, preds])
+            return preds
+
+        # 5. RUN PREDICTION & VERDICT
+        with st.spinner("Running LSTM Model..."):
+            final_probs = predict_proba_for_lime([raw_sequence])[0]
+            prob_ransomware = final_probs[1]
             
             st.divider()
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if prediction > 0.5:
-                    st.error(f"VERDICT: RANSOMWARE ({prediction*100:.1f}%)")
-                else:
-                    st.success(f"VERDICT: BENIGN ({(1-prediction)*100:.1f}%)")
+            if prob_ransomware > 0.5:
+                st.error(f"🔥 VERDICT: RANSOMWARE ({prob_ransomware*100:.2f}%)")
+            else:
+                st.success(f"🛡️ VERDICT: BENIGN ({(1-prob_ransomware)*100:.2f}%)")
+
+        # 6. RUN LIME EXPLANATION
+        with st.spinner("Generating LIME Explanation (this may take a minute)..."):
+            explainer = LimeTextExplainer(class_names=['Benign', 'Ransomware'])
             
-            with col_b:
-                st.write("**Captured API Sequence (Partial):**")
-                st.caption(raw_sequence[:300] + "...")
-        else:
-            st.warning("No behavior captured. Malware might be sandbox-aware.")
+            exp = explainer.explain_instance(
+                raw_sequence, 
+                predict_proba_for_lime, 
+                num_features=10, 
+                num_samples=100
+            )
+            
+            st.write("### 🧠 Why did the LSTM think this?")
+            st.caption("The terms highlighted in **orange/red** pushed the model toward Ransomware, while **blue** pushed it toward Benign.")
+            
+            components.html(exp.as_html(), height=600, scrolling=True)
