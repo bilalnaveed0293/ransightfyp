@@ -127,10 +127,6 @@ with tab1:
                     messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}]}],
                 )
                 st.write(response.choices[0].message.content)
-
-# ==================================================================
-# TAB 2: DYNAMIC ANALYSIS (LSTM + HA)
-# ==================================================================
 with tab2:
     st.header("Dynamic Analysis: Triage Sandbox & LIME")
     st.markdown("Standardized **60-second execution**. Extracting 500 APIs, 10 DLLs, and 10 Mutexes.")
@@ -138,15 +134,32 @@ with tab2:
     uploaded_dynamic = st.file_uploader("Upload .exe for Sandbox Analysis", type=["exe"], key="dyn_up")
 
     if uploaded_dynamic and st.button("Start Full Analysis"):
+        import streamlit.components.v1 as components
+        import json
+
         API_KEY = st.secrets["TRIAGE_API_KEY"]
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         BASE_URL = "https://api.tria.ge/v0"
 
-        # ── STEP 1: SUBMIT ──────────────────────────────────────────────────
+        # ── STEP 1: SUBMIT ──────────────────────────────────────────────────────
         with st.spinner("Uploading to Triage sandbox..."):
             files = {"file": (uploaded_dynamic.name, uploaded_dynamic.getvalue())}
-            data = {"_json": '{"kind":"file","interactive":false}'}
-            
+
+            submission_json = json.dumps({
+                "kind": "file",
+                "interactive": False,
+                "profiles": [
+                    {
+                        "profile": {
+                            "tags": ["os:windows10-2004-x64"],
+                            "timeout": 60,
+                            "network": "internet"
+                        }
+                    }
+                ]
+            })
+            data = {"_json": submission_json}
+
             res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
 
             if res.status_code not in (200, 201):
@@ -158,12 +171,12 @@ with tab2:
                 st.error(f"No sample ID returned. Response: {res.json()}")
                 st.stop()
 
-            st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for execution...")
+            st.info(f"✅ Submitted. Sample ID: `{sample_id}` — waiting for execution + reporting...")
 
-        # ── STEP 2: POLL SAMPLE STATUS ──────────────────────────────────────
+        # ── STEP 2: POLL SAMPLE STATUS (up to 5 minutes) ────────────────────────
         bar = st.progress(0)
         status_text = st.empty()
-        MAX_WAIT = 60
+        MAX_WAIT = 60  # 60 × 5s = 300s
         curr_status = "pending"
 
         for i in range(MAX_WAIT):
@@ -173,93 +186,122 @@ with tab2:
                 continue
             curr_status = check.json().get("status", "unknown")
             bar.progress(int(min((i + 1) / MAX_WAIT * 100, 100)))
-            status_text.text(f"Status: {curr_status} ({(i+1)*5}s / {MAX_WAIT*5}s)")
+            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_WAIT*5}s)")
             if curr_status in ("reported", "failed"):
                 break
 
         if curr_status == "failed":
-            st.error("Triage analysis failed.")
+            st.error("Triage analysis failed. The sample may have crashed or been rejected.")
             st.stop()
 
         if curr_status != "reported":
-            st.warning("Triage did not finish in time.")
+            st.warning("Triage did not finish in time. Try again or check the sample manually on tria.ge.")
             st.stop()
 
-        # ── STEP 3: GET TASK ID ─────────────────────────────────────────────
-        sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
-        tasks_dict = sample_info.get("tasks", {})
-
-        if not tasks_dict:
-            st.error("No behavioral tasks found.")
-            st.stop()
-
-        task_id = None
-        for tid, tinfo in tasks_dict.items():
-            if tinfo.get("kind") == "behavioral":
-                task_id = tid
-                break
-        if not task_id:
-            task_id = list(tasks_dict.keys())[0]
-
-        # ── STEP 4: WAIT FOR TASK-LEVEL REPORT ──────────────────────────────
+        # ── STEP 3: WAIT FOR BEHAVIORAL TASK TO BE READY ────────────────────────
         with st.spinner("Finalizing behavioral logs..."):
             for _ in range(20):
-                task_check = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}", headers=HEADERS)
-                if task_check.status_code == 200 and task_check.json().get("status") == "reported":
-                    break
+                task_check = requests.get(
+                    f"{BASE_URL}/samples/{sample_id}/behavioral1",
+                    headers=HEADERS
+                )
+                if task_check.status_code == 200:
+                    if task_check.json().get("status") == "reported":
+                        break
                 time.sleep(5)
 
-        # ── STEP 5: FETCH REPORT JSON ──────────────────────────────────────
-        report_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{task_id}/report_triage.json", headers=HEADERS)
+        # ── STEP 4: FETCH BEHAVIORAL JSON REPORT ────────────────────────────────
+        report_res = requests.get(
+            f"{BASE_URL}/samples/{sample_id}/behavioral1/report_triage.json",
+            headers=HEADERS
+        )
+
         if report_res.status_code != 200:
-            st.error(f"Failed to retrieve report: {report_res.text}")
+            st.error(f"Failed to retrieve report (HTTP {report_res.status_code}): {report_res.text}")
             st.stop()
 
         report_data = report_res.json()
 
-        # ── STEP 6: FEATURE EXTRACTION ─────────────────────────────────────
-        raw_apis, raw_dlls, raw_mutexes = [], [], []
+        # Debug expander — remove once confirmed working
+        with st.expander("🔍 Raw Report Debug (remove after testing)"):
+            st.write("Top-level keys:", list(report_data.keys()))
+            if report_data.get("processes"):
+                st.write("First process keys:", list(report_data["processes"][0].keys()))
+
+        # ── STEP 5: FEATURE EXTRACTION (matching Xran dataset format) ────────────
+        raw_apis    = []
+        raw_dlls    = []
+        raw_mutexes = []
 
         for proc in report_data.get("processes", []):
+
+            # 500 API calls
             for call in proc.get("calls", []):
                 api_name = call.get("api")
-                if api_name: raw_apis.append(api_name)
+                if api_name:
+                    raw_apis.append(api_name)
 
+            # 10 DLLs — correct field is "modules"
             for mod in proc.get("modules", []):
-                if isinstance(mod, str): raw_dlls.append(mod)
+                if isinstance(mod, str):
+                    raw_dlls.append(mod)
                 elif isinstance(mod, dict):
                     name = mod.get("basename") or mod.get("path", "")
-                    if name: raw_dlls.append(name.split("\\")[-1])
+                    if name:
+                        raw_dlls.append(name.split("\\")[-1])
 
+            # 10 Mutexes — correct field is "mutants"
             for mutant in proc.get("mutants", []):
-                if isinstance(mutant, str): raw_mutexes.append(mutant)
+                if isinstance(mutant, str):
+                    raw_mutexes.append(mutant)
                 elif isinstance(mutant, dict):
                     name = mutant.get("name", "")
-                    if name: raw_mutexes.append(name)
+                    if name:
+                        raw_mutexes.append(name)
 
+        with st.expander("🔍 Extraction Debug"):
+            st.write(f"APIs extracted: {len(raw_apis)} (using first 500)")
+            st.write(f"DLLs extracted: {len(raw_dlls)} (using first 10)")
+            st.write(f"Mutexes extracted: {len(raw_mutexes)} (using first 10)")
+            st.write("Sample APIs:", raw_apis[:10])
+            st.write("Sample DLLs:", raw_dlls[:10])
+            st.write("Sample Mutexes:", raw_mutexes[:10])
+
+        # Build final sequence exactly matching Xran training format
         final_sequence = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
 
         if not final_sequence.strip():
-            st.error("Extracted sequence is empty.")
+            st.error("Extracted sequence is empty — the malware may not have executed properly in the sandbox.")
             st.stop()
 
-        # ── STEP 7: PREDICTION ─────────────────────────────────────────────
+        # ── STEP 6: LSTM PREDICTION ──────────────────────────────────────────────
         def predict_proba(texts):
-            seqs = tokenizer.texts_to_sequences(texts)
+            seqs   = tokenizer.texts_to_sequences(texts)
             padded = pad_sequences(seqs, maxlen=520, padding="post", truncating="post")
-            preds = lstm_model.predict(padded)
-            return np.hstack([1 - preds, preds]) if preds.shape[1] == 1 else preds
+            preds  = lstm_model.predict(padded)
+            if preds.shape[1] == 1:
+                return np.hstack([1 - preds, preds])
+            return preds
 
         probs = predict_proba([final_sequence])[0]
+
         st.divider()
         if probs[1] > 0.5:
             st.error(f"🔥 VERDICT: RANSOMWARE — {probs[1]*100:.2f}% confidence")
         else:
             st.success(f"🛡️ VERDICT: BENIGN — {probs[0]*100:.2f}% confidence")
 
-        # ── STEP 8: LIME ───────────────────────────────────────────────────
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Ransomware Probability", f"{probs[1]*100:.2f}%")
+        with col2:
+            st.metric("Benign Probability", f"{probs[0]*100:.2f}%")
+
+        # ── STEP 7: LIME EXPLANATION ─────────────────────────────────────────────
         with st.spinner("Generating LIME explanation..."):
             explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
-            exp = explainer.explain_instance(final_sequence, predict_proba, num_features=10)
-            st.write("### 🧠 Top Features (API / DLL / Mutex)")
+            exp = explainer.explain_instance(
+                final_sequence, predict_proba, num_features=10
+            )
+            st.write("### 🧠 Top Features (API calls / DLLs / Mutexes)")
             components.html(exp.as_html(), height=600, scrolling=True)
