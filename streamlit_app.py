@@ -161,11 +161,6 @@ with tab1:
             
             st.text_area(f"Raw Bytes (Offsets 0x{start_b:X} to 0x{end_b:X})", dump_output, height=300)
             
-            st.info(
-                "💡 **How to interpret this:** High-entropy encrypted payloads look like completely random garbled text "
-                "in the text column. If the model is picking up static API calls, you'll see readable strings pointing "
-                "to system functions."
-            )
 with tab2:
             st.header("Dynamic Analysis: Triage Sandbox & LIME")
             st.markdown("Standardized **60-second execution**. Aggressively extracting APIs, DLLs, and Mutexes.")
