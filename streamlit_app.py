@@ -13,6 +13,7 @@ from groq import Groq
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from lime.lime_text import LimeTextExplainer
 import streamlit.components.v1 as components
+from collections import Counter
 
 # --- 1. Page Config & Styling ---
 st.set_page_config(page_title="RanSight AI", page_icon="🛡️", layout="wide")
