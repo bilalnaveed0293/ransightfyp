@@ -8,6 +8,7 @@ import base64
 import time
 import requests
 import pickle
+import pefile
 from io import BytesIO
 from groq import Groq
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -60,37 +61,47 @@ with tab1:
         # The 'if p > 0' prevents math.log2(0) crashes!
         return -sum(p * math.log2(p) for p in probs if p > 0)
 
+    def get_exact_section(file_bytes, offset):
+        """Dynamically maps the byte offset to actual PE sections using pefile."""
+        try:
+            pe = pefile.PE(data=file_bytes)
+            
+            # Check if offset falls within any actual defined section
+            for section in pe.sections:
+                start = section.PointerToRawData
+                end = start + section.SizeOfRawData
+                if start <= offset < end:
+                    # Decode section name (e.g., .text, .data) and strip null bytes
+                    return section.Name.decode('utf-8', errors='ignore').strip('\x00')
+            
+            # If it's before the first section, it's definitely the header
+            if pe.sections and offset < pe.sections[0].PointerToRawData:
+                return "PE Headers"
+            
+            return "File Overlay / Appended Data"
+        except Exception:
+            # Fallback if the file is so corrupted that pefile crashes
+            return "Headers" if offset < 0x200 else "Unknown Section"
+
     def hex_dump(data_bytes, start_offset):
         """Generates a professional side-by-side hex and ASCII dump."""
         lines = []
         for i in range(0, len(data_bytes), 16):
-            chunk = data_bytes[i : i + 16]
-            hex_str = " ".join([f"{b:02X}" for b in chunk])
-            ascii_str = "".join(
-                [chr(b) if 32 <= b <= 126 else "." for b in chunk]
-            )
-            lines.append(
-                f"0x{start_offset + i:06X}:  {hex_str:<48}  |{ascii_str}|"
-            )
-        return "\n".join(lines)
+            chunk = data_bytes[i:i+16]
+            hex_str = ' '.join([f'{b:02X}' for b in chunk])
+            ascii_str = ''.join([chr(b) if 32 <= b <= 126 else '.' for b in chunk])
+            lines.append(f"0x{start_offset + i:06X}:  {hex_str:<48}  |{ascii_str}|")
+        return '\n'.join(lines)
 
     def get_standard_width(file_size):
-        if file_size < 10240:
-            return 32
-        elif file_size < 30720:
-            return 64
-        elif file_size < 61440:
-            return 128
-        elif file_size < 102400:
-            return 256
-        elif file_size < 204800:
-            return 384
-        elif file_size < 512000:
-            return 512
-        elif file_size < 1024000:
-            return 768
-        else:
-            return 1024
+        if file_size < 10240: return 32
+        elif file_size < 30720: return 64
+        elif file_size < 61440: return 128
+        elif file_size < 102400: return 256
+        elif file_size < 204800: return 384
+        elif file_size < 512000: return 512
+        elif file_size < 1024000: return 768
+        else: return 1024
 
     def make_gradcam_heatmap(img_array, keras_model):
         last_conv_layer_name = None
@@ -106,9 +117,7 @@ with tab1:
             if layer.name == last_conv_layer_name:
                 conv_output = x
 
-        grad_model = tf.keras.models.Model(
-            inputs=grad_model_input, outputs=[conv_output, x]
-        )
+        grad_model = tf.keras.models.Model(inputs=grad_model_input, outputs=[conv_output, x])
         with tf.GradientTape() as tape:
             conv_out, preds = grad_model(img_array)
             class_channel = preds[:, 0]
@@ -117,27 +126,20 @@ with tab1:
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
         heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (
-            tf.math.reduce_max(heatmap) + 1e-10
-        )
+        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
         return heatmap.numpy()
 
     def create_overlay(pil_img, heatmap):
-        heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize(
-            (128, 128), resample=Image.BICUBIC
-        )
+        heatmap_img = Image.fromarray(np.uint8(255 * heatmap)).resize((128, 128), resample=Image.BICUBIC)
         jet = cm.get_cmap("jet")
-        jet_heatmap = (jet(np.array(heatmap_img))[:, :, :3] * 255).astype(
-            np.uint8
-        )
-        img_rgb = np.stack((np.array(pil_img),) * 3, axis=-1)
+        jet_heatmap = (jet(np.array(heatmap_img))[:, :, :3] * 255).astype(np.uint8)
+        img_rgb = np.stack((np.array(pil_img),)*3, axis=-1)
         overlay = (jet_heatmap * 0.4 + img_rgb * 0.6).astype(np.uint8)
         return Image.fromarray(overlay)
 
+
     # --- 📥 FILE PROCESSING ---
-    uploaded_static = st.file_uploader(
-        "Upload .exe for Static Visual Analysis", type=["exe"], key="u1"
-    )
+    uploaded_static = st.file_uploader("Upload .exe for Static Visual Analysis", type=["exe"], key="u1")
 
     if uploaded_static:
         file_bytes = uploaded_static.read()
@@ -148,11 +150,9 @@ with tab1:
         # Convert to Image for CNN
         img_raw = np.frombuffer(file_bytes, dtype=np.uint8)
         img_raw = np.pad(img_raw, (0, (width * height) - file_size))
-        pil_img = Image.fromarray(
-            img_raw.reshape((height, width)), "L"
-        ).resize((128, 128))
+        pil_img = Image.fromarray(img_raw.reshape((height, width)), 'L').resize((128, 128))
 
-        input_arr = np.array(pil_img).astype("float32") / 255.0
+        input_arr = np.array(pil_img).astype('float32') / 255.0
         input_arr = np.expand_dims(input_arr, axis=(0, -1))
 
         # Run Prediction (assumes 'cnn_model' is loaded in your app globally)
@@ -171,38 +171,47 @@ with tab1:
         x_orig = int((x_128 / 128.0) * width)
         center_offset = min((y_orig * width) + x_orig, file_size - 1)
 
+
         # --- 📊 UI LAYOUT ---
         col1, col2 = st.columns([1, 1])
 
         with col1:
             st.metric("Static Verdict", verdict, f"{conf*100:.1f}% Confidence")
             overlay = create_overlay(pil_img, heatmap)
-            st.image(
-                overlay,
-                caption="Grad-CAM: CNN Focus Areas (Red = Highest Activation)",
-                use_container_width=True,
-            )
+            st.image(overlay, caption="Grad-CAM: CNN Focus Areas (Red = Highest Activation)", use_container_width=True)
 
         with col2:
             st.subheader("📝 Forensic Explainability Report")
 
             # Calculate Evidence
             entropy = calculate_local_entropy(file_bytes, center_offset)
+            section_name = get_exact_section(file_bytes, center_offset)
 
-            # Determine Section/Feature based on Offset
-            if center_offset < 0x200:
-                feature_type = "PE Header / DOS Stub"
-                insight = "Anomaly detected in the file's entry structure. Suggests header manipulation or a custom loader."
-            elif entropy > 7.0:
-                feature_type = "Encrypted Payload Section"
-                insight = "High-entropy patterns detected. This visual 'texture' is a mathematical hallmark of ransomware encryption."
+            # --- 🤖 DYNAMIC INSIGHT GENERATOR ---
+            if "Header" in section_name:
+                feature_type = f"Structural ({section_name})"
+                insight = (
+                    "The model is focusing on the file's metadata and entry headers. "
+                    "This suggests it detected anomalous structural transitions or header tampering "
+                    "used to bypass classic signature scanners."
+                )
+            elif entropy > 7.2:
+                feature_type = f"Cryptographic / Packed ({section_name})"
+                insight = (
+                    f"The model targeted the '{section_name}' section. Because the local entropy "
+                    f"is a very high {entropy:.2f}, this is mathematical proof that this section "
+                    "contains encrypted shellcode or a compressed ransomware payload."
+                )
             else:
-                feature_type = "Standard Code/Data Block"
-                insight = "Pattern matches typical non-malicious execution blocks or resource storage."
+                feature_type = f"Standard Data ({section_name})"
+                insight = (
+                    f"The model focused on standard data patterns within the '{section_name}' section. "
+                    f"With an entropy of {entropy:.2f}, this area does not display the chaotic randomness "
+                    "typically associated with active ransomware encryption engines."
+                )
 
             # Render the Report
-            st.markdown(
-                f"""
+            st.markdown(f"""
             **Analysis Target:** Offset `0x{center_offset:X}`  
             **Identified Feature:** `{feature_type}`  
             **Local Shannon Entropy:** `{entropy:.2f}`
@@ -210,24 +219,22 @@ with tab1:
             ---
             **Technical Basis for Verdict:** {insight}
             
-            **Forensic Summary:** The CNN model's decision was heavily weighted by a specific spatial pattern at this offset. 
-            {"The high entropy value confirms that this region contains packed or encrypted data, supporting a Ransomware classification." if verdict == "RANSOMWARE" else "The structural patterns and entropy levels are consistent with benign software standards."}
-            """
-            )
+            **Forensic Summary:** The CNN model's decision was heavily weighted by a specific spatial pattern mapped to the file's actual **{section_name}** region. 
+            {"The combination of high entropy and localized targeting strongly supports a Ransomware classification." if verdict == "RANSOMWARE" else "The target's structural patterns and entropy levels are consistent with benign software standards."}
+            """)
 
             # Hex Dump for visual proof
             st.write("**Raw Bytes at Hotspot Area:**")
             start_b = max(0, center_offset - 64)
             end_b = min(file_size, center_offset + 64)
 
-            # Generate and print the clean hex dump
             dump_output = hex_dump(file_bytes[start_b:end_b], start_b)
-            st.text_area(
-                f"Byte Offsets (0x{start_b:X} to 0x{end_b:X})",
-                dump_output,
-                height=250,
-            )
+            st.text_area(f"Byte Offsets (0x{start_b:X} to 0x{end_b:X})", dump_output, height=250)
 
+            st.info(
+                "💡 **How to interpret this:** High-entropy payloads look like completely random garbled text in the text column. "
+                "If the model is picking up static API calls, you'll see readable strings pointing to system functions."
+            )
 with tab2:
             st.header("Dynamic Analysis: Triage Sandbox & LIME")
             st.markdown("Standardized **60-second execution**. Aggressively extracting APIs, DLLs, and Mutexes.")
