@@ -46,7 +46,7 @@ with tab1:
     st.header("Static Analysis: Binary Image Visualization")
     
     # --- 🛠️ INTERNAL FORENSIC ENGINE ---
-    def calculate_local_entropy(data, offset, window_size=256):
+def calculate_local_entropy(data, offset, window_size=256):
     start = max(0, offset - (window_size // 2))
     end = min(len(data), offset + (window_size // 2))
     chunk = data[start:end]
@@ -54,6 +54,9 @@ with tab1:
     
     counts = Counter(chunk)
     probs = [c / len(chunk) for c in counts.values()]
+    
+    # ADDED: 'if p > 0' to avoid math.log2(0) errors
+    return -sum(p * math.log2(p) for p in probs if p > 0)
     
     # ADDED: 'if p > 0' to avoid math.log2(0) errors
     return -sum(p * math.log2(p) for p in probs if p > 0)
