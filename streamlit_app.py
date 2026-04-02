@@ -47,14 +47,16 @@ with tab1:
     
     # --- 🛠️ INTERNAL FORENSIC ENGINE ---
     def calculate_local_entropy(data, offset, window_size=256):
-        start = max(0, offset - (window_size // 2))
-        end = min(len(data), offset + (window_size // 2))
-        chunk = data[start:end]
-        if not chunk: return 0
-        counts = Counter(chunk)
-        probs = [c / len(chunk) for c in counts.values()]
-        return -sum(p * math.log2(p) for p in probs)
-
+    start = max(0, offset - (window_size // 2))
+    end = min(len(data), offset + (window_size // 2))
+    chunk = data[start:end]
+    if not chunk: return 0
+    
+    counts = Counter(chunk)
+    probs = [c / len(chunk) for c in counts.values()]
+    
+    # ADDED: 'if p > 0' to avoid math.log2(0) errors
+    return -sum(p * math.log2(p) for p in probs if p > 0)
     def get_standard_width(file_size):
         if file_size < 10240: return 32
         elif file_size < 30720: return 64
