@@ -45,21 +45,6 @@ tab1, tab2 = st.tabs(["📂 Static Analysis (CNN)", "⚙️ Dynamic Analysis (LS
 with tab1:
     st.header("Static Analysis: Binary Image Visualization")
     
-    # --- 🛠️ INTERNAL FORENSIC ENGINE ---
-def calculate_local_entropy(data, offset, window_size=256):
-    start = max(0, offset - (window_size // 2))
-    end = min(len(data), offset + (window_size // 2))
-    chunk = data[start:end]
-    if not chunk: return 0
-    
-    counts = Counter(chunk)
-    probs = [c / len(chunk) for c in counts.values()]
-    
-    # ADDED: 'if p > 0' to avoid math.log2(0) errors
-    return -sum(p * math.log2(p) for p in probs if p > 0)
-    
-    # ADDED: 'if p > 0' to avoid math.log2(0) errors
-    return -sum(p * math.log2(p) for p in probs if p > 0)
     def get_standard_width(file_size):
         if file_size < 10240: return 32
         elif file_size < 30720: return 64
@@ -79,21 +64,22 @@ def calculate_local_entropy(data, offset, window_size=256):
         
         grad_model_input = tf.keras.Input(shape=(128, 128, 1))
         x = grad_model_input
+        last_conv_output = None
         for layer in keras_model.layers:
             x = layer(x)
             if layer.name == last_conv_layer_name:
-                conv_output = x
+                last_conv_output = x
 
-        grad_model = tf.keras.models.Model(inputs=grad_model_input, outputs=[conv_output, x])
+        grad_model = tf.keras.models.Model(inputs=grad_model_input, outputs=[last_conv_output, x])
         with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(img_array)
+            last_conv_layer_output, preds = grad_model(img_array)
             class_channel = preds[:, 0]
 
-        grads = tape.gradient(class_channel, conv_out)
+        grads = tape.gradient(class_channel, last_conv_layer_output)
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
+        heatmap = last_conv_layer_output[0] @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
+        heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
         return heatmap.numpy()
 
     def create_overlay(pil_img, heatmap):
@@ -104,83 +90,82 @@ def calculate_local_entropy(data, offset, window_size=256):
         overlay = (jet_heatmap * 0.4 + img_rgb * 0.6).astype(np.uint8)
         return Image.fromarray(overlay)
 
-    # --- 📥 FILE PROCESSING ---
+    # --- 🛠️ NEW FORENSIC HELPERS ---
+    def get_malicious_byte_range(heatmap, original_width, original_height, file_size):
+        # 1. Find the hottest coordinate on the 128x128 heatmap
+        max_idx = np.argmax(heatmap)
+        y_128, x_128 = divmod(max_idx, 128)
+        
+        # 2. Scale coordinate back to the dynamic image dimensions
+        y_orig = int((y_128 / 128.0) * original_height)
+        x_orig = int((x_128 / 128.0) * original_width)
+        
+        # 3. Map it back to the file's 1D byte array offset
+        byte_offset = (y_orig * original_width) + x_orig
+        byte_offset = min(byte_offset, file_size - 1)
+        
+        # 4. Extract a 256-byte window around the localized coordinate
+        start_byte = max(0, byte_offset - 128)
+        end_byte = min(file_size, byte_offset + 128)
+        return start_byte, end_byte, byte_offset
+
+    def hex_dump(data_bytes, start_offset):
+        lines = []
+        for i in range(0, len(data_bytes), 16):
+            chunk = data_bytes[i:i+16]
+            hex_str = ' '.join([f'{b:02X}' for b in chunk])
+            ascii_str = ''.join([chr(b) if 32 <= b <= 126 else '.' for b in chunk])
+            lines.append(f"0x{start_offset + i:06X}:  {hex_str:<48}  |{ascii_str}|")
+        return '\n'.join(lines)
+
     uploaded_static = st.file_uploader("Upload .exe for Static Visual Analysis", type=["exe"], key="u1")
 
     if uploaded_static:
-        file_bytes = uploaded_static.read()
-        file_size = len(file_bytes)
-        width = get_standard_width(file_size)
-        height = int(np.ceil(file_size / width))
-        
-        # Convert to Image for CNN
-        img_raw = np.frombuffer(file_bytes, dtype=np.uint8)
-        img_raw = np.pad(img_raw, (0, (width * height) - file_size))
+        data = uploaded_static.read()
+        width = get_standard_width(len(data))
+        height = int(np.ceil(len(data) / width))
+        img_raw = np.frombuffer(data, dtype=np.uint8)
+        img_raw = np.pad(img_raw, (0, (width * height) - len(data)))
         pil_img = Image.fromarray(img_raw.reshape((height, width)), 'L').resize((128, 128))
         
         input_arr = np.array(pil_img).astype('float32') / 255.0
         input_arr = np.expand_dims(input_arr, axis=(0, -1))
         
-        # Run Prediction
+        # Note: Ensure 'cnn_model' is loaded in your app context
         prediction = cnn_model.predict(input_arr)
         prob = float(prediction[0][0])
         verdict = "RANSOMWARE" if prob > 0.5 else "BENIGN"
         conf = prob if prob > 0.5 else (1 - prob)
 
-        # Generate Heatmap and find Focal Point
-        heatmap = make_gradcam_heatmap(input_arr, cnn_model)
-        max_idx = np.argmax(heatmap)
-        y_128, x_128 = divmod(max_idx, 128)
+        col1, col2 = st.columns(2)
         
-        # Map back to raw file offset
-        y_orig = int((y_128 / 128.0) * height)
-        x_orig = int((x_128 / 128.0) * width)
-        center_offset = min((y_orig * width) + x_orig, file_size - 1)
-
-        # --- 📊 UI LAYOUT ---
-        col1, col2 = st.columns([1, 1])
+        # Generate the heatmap so it can be accessed by both columns
+        heatmap = make_gradcam_heatmap(input_arr, cnn_model)
 
         with col1:
             st.metric("Static Verdict", verdict, f"{conf*100:.1f}% Confidence")
             overlay = create_overlay(pil_img, heatmap)
-            st.image(overlay, caption="Grad-CAM: CNN Focus Areas (Red = Highest Activation)", use_container_width=True)
+            st.image(overlay, caption="Grad-CAM: Suspicious Byte Heatmap", use_container_width=True)
 
         with col2:
-            st.subheader("📝 Forensic Explainability Report")
+            st.subheader("🔬 Deterministic Byte Forensics")
             
-            # Calculate Evidence
-            entropy = calculate_local_entropy(file_bytes, center_offset)
+            # Run the math to trace heatmap back to the raw file
+            start_b, end_b, center_b = get_malicious_byte_range(heatmap, width, height, len(data))
             
-            # Determine Section/Feature based on Offset
-            if center_offset < 0x200:
-                feature_type = "PE Header / DOS Stub"
-                insight = "Anomaly detected in the file's entry structure. Suggests header manipulation or a custom loader."
-            elif entropy > 7.0:
-                feature_type = "Encrypted Payload Section"
-                insight = "High-entropy patterns detected. This visual 'texture' is a mathematical hallmark of ransomware encryption."
-            else:
-                feature_type = "Standard Code/Data Block"
-                insight = "Pattern matches typical non-malicious execution blocks or resource storage."
-
-            # Render the Report
-            st.markdown(f"""
-            **Analysis Target:** Offset `0x{center_offset:X}`  
-            **Identified Feature:** `{feature_type}`  
-            **Local Shannon Entropy:** `{entropy:.2f}`
+            st.warning(f"The CNN relied heavily on patterns centered around file offset **0x{center_b:X}**.")
             
-            ---
-            **Technical Basis for Verdict:** {insight}
+            # Extract the raw bytes and produce the hex dump
+            suspicious_bytes = data[start_b:end_b]
+            dump_output = hex_dump(suspicious_bytes, start_b)
             
-            **Forensic Summary:** The CNN model's decision was heavily weighted by a specific spatial pattern at this offset. 
-            {"The high entropy value confirms that this region contains packed or encrypted data, supporting a Ransomware classification." if verdict == "RANSOMWARE" else "The structural patterns and entropy levels are consistent with benign software standards."}
-            """)
-
-            # Hex Dump for visual proof
-            st.text("Raw Bytes at Hotspot:")
-            start_b = max(0, center_offset - 64)
-            end_b = min(file_size, center_offset + 64)
-            hex_view = ' '.join([f'{b:02X}' for b in file_bytes[start_b:end_b]])
-            st.caption(f"Hex: {hex_view[:100]}...")
+            st.text_area(f"Raw Bytes (Offsets 0x{start_b:X} to 0x{end_b:X})", dump_output, height=300)
+            
+            st.info(
+                "💡 **How to interpret this:** High-entropy encrypted payloads look like completely random garbled text "
+                "in the text column. If the model is picking up static API calls, you'll see readable strings pointing "
+                "to system functions."
+            )
 with tab2:
             st.header("Dynamic Analysis: Triage Sandbox & LIME")
             st.markdown("Standardized **60-second execution**. Aggressively extracting APIs, DLLs, and Mutexes.")
