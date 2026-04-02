@@ -228,11 +228,6 @@ with tab1:
                 height=250,
             )
 
-            st.info(
-                "💡 **How to interpret this:** High-entropy payloads look like completely random garbled text in the text column. "
-                "If the model is picking up static API calls, you'll see readable strings pointing to system functions."
-            )
-            
 with tab2:
             st.header("Dynamic Analysis: Triage Sandbox & LIME")
             st.markdown("Standardized **60-second execution**. Aggressively extracting APIs, DLLs, and Mutexes.")
