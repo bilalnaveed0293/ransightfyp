@@ -89,6 +89,34 @@ with tab1:
         overlay = (jet_heatmap * 0.4 + img_rgb * 0.6).astype(np.uint8)
         return Image.fromarray(overlay)
 
+    # --- 🛠️ NEW FORENSIC HELPERS ---
+    def get_malicious_byte_range(heatmap, original_width, original_height, file_size):
+        # 1. Find the hottest coordinate on the 128x128 heatmap
+        max_idx = np.argmax(heatmap)
+        y_128, x_128 = divmod(max_idx, 128)
+        
+        # 2. Scale coordinate back to the dynamic image dimensions
+        y_orig = int((y_128 / 128.0) * original_height)
+        x_orig = int((x_128 / 128.0) * original_width)
+        
+        # 3. Map it back to the file's 1D byte array offset
+        byte_offset = (y_orig * original_width) + x_orig
+        byte_offset = min(byte_offset, file_size - 1)
+        
+        # 4. Extract a 256-byte window around the localized coordinate
+        start_byte = max(0, byte_offset - 128)
+        end_byte = min(file_size, byte_offset + 128)
+        return start_byte, end_byte, byte_offset
+
+    def hex_dump(data_bytes, start_offset):
+        lines = []
+        for i in range(0, len(data_bytes), 16):
+            chunk = data_bytes[i:i+16]
+            hex_str = ' '.join([f'{b:02X}' for b in chunk])
+            ascii_str = ''.join([chr(b) if 32 <= b <= 126 else '.' for b in chunk])
+            lines.append(f"0x{start_offset + i:06X}:  {hex_str:<48}  |{ascii_str}|")
+        return '\n'.join(lines)
+
     uploaded_static = st.file_uploader("Upload .exe for Static Visual Analysis", type=["exe"], key="u1")
 
     if uploaded_static:
@@ -102,31 +130,41 @@ with tab1:
         input_arr = np.array(pil_img).astype('float32') / 255.0
         input_arr = np.expand_dims(input_arr, axis=(0, -1))
         
+        # Note: Ensure 'cnn_model' is loaded in your app context
         prediction = cnn_model.predict(input_arr)
         prob = float(prediction[0][0])
         verdict = "RANSOMWARE" if prob > 0.5 else "BENIGN"
         conf = prob if prob > 0.5 else (1 - prob)
 
         col1, col2 = st.columns(2)
+        
+        # Generate the heatmap so it can be accessed by both columns
+        heatmap = make_gradcam_heatmap(input_arr, cnn_model)
+
         with col1:
             st.metric("Static Verdict", verdict, f"{conf*100:.1f}% Confidence")
-            heatmap = make_gradcam_heatmap(input_arr, cnn_model)
             overlay = create_overlay(pil_img, heatmap)
             st.image(overlay, caption="Grad-CAM: Suspicious Byte Heatmap", use_container_width=True)
 
         with col2:
-            st.subheader("🤖 AI Forensic Insight")
-            if st.button("Explain Heatmap (Groq)"):
-                buffered = BytesIO()
-                overlay.save(buffered, format="PNG")
-                img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                
-                prompt = f"Analyze this malware binary heatmap. Result: {verdict}. Provide 3 technical reasons why these byte patterns look like ransomware."
-                response = groq_client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}}]}],
-                )
-                st.write(response.choices[0].message.content)
+            st.subheader("🔬 Deterministic Byte Forensics")
+            
+            # Run the math to trace heatmap back to the raw file
+            start_b, end_b, center_b = get_malicious_byte_range(heatmap, width, height, len(data))
+            
+            st.warning(f"The CNN relied heavily on patterns centered around file offset **0x{center_b:X}**.")
+            
+            # Extract the raw bytes and produce the hex dump
+            suspicious_bytes = data[start_b:end_b]
+            dump_output = hex_dump(suspicious_bytes, start_b)
+            
+            st.text_area(f"Raw Bytes (Offsets 0x{start_b:X} to 0x{end_b:X})", dump_output, height=300)
+            
+            st.info(
+                "💡 **How to interpret this:** High-entropy encrypted payloads look like completely random garbled text "
+                "in the text column. If the model is picking up static API calls, you'll see readable strings pointing "
+                "to system functions."
+            )
 with tab2:
             st.header("Dynamic Analysis: Triage Sandbox & LIME")
             st.markdown("Standardized **60-second execution**. Aggressively extracting APIs, DLLs, and Mutexes.")
