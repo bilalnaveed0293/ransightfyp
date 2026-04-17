@@ -19,6 +19,7 @@ import math
 import joblib
 import pandas as pd
 import json
+from typing import Dict, List, Optional
 
 # --- 1. Page Config & Styling ---
 st.set_page_config(page_title="RanSight AI", page_icon="🛡️", layout="wide")
