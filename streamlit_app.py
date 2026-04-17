@@ -406,6 +406,9 @@ with tab3:
 
         if conf_s1 >= theta_1:
             st.success(f"✅ Stage 1 Confidence ({conf_s1:.2f}) meets θ1 threshold ({theta_1:.2f}). Exiting pipeline early!")
+            heatmap = make_gradcam_heatmap(input_arr, cnn_model)
+            max_idx = np.argmax(heatmap)
+            y_128, x_128 = divmod(max_idx, 128)
             st.stop()
         else:
             st.warning(f"⚠️ Stage 1 Confidence ({conf_s1:.2f}) is below θ1 threshold ({theta_1:.2f}). Escalating to Stage 2...")
