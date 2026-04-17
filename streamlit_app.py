@@ -137,10 +137,11 @@ def predict_proba_lstm(texts):
 
 
 # --- 3. TABS SETUP ---
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📂 Static Analysis (CNN)", 
     "⚙️ Dynamic Analysis (LSTM + HA)", 
-    "🚀 Full Gated Pipeline"
+    "🚀 Full Gated Pipeline",
+    "🧪 Memory Feature Extraction"
 ])
 
 # ==================================================================
@@ -597,3 +598,376 @@ with tab3:
             
             st.metric("Final Stage 3 Verdict", final_verdict, f"{mem_conf*100:.2f}% Confidence")
             st.info("🎯 Pipeline Exhausted: The Memory Classifier's verdict is the final decision.")
+# ==================================================================
+# TAB 4: MEMORY FEATURE EXTRACTION & TESTING
+# ==================================================================
+with tab4:
+    st.header("🧪 Memory Feature Extraction & Testing (CIC-MalMem-2022)")
+    st.markdown("Extract volatility memory features directly from Triage API and test Stage 3 classifier")
+    
+    # --- FEATURE DEFINITIONS ---
+    MALMEM_FEATURES = [
+        'pslist.nproc', 'pslist.nppid', 'pslist.avg_threads', 'pslist.nprocs64bit',
+        'pslist.avg_handlers', 'dlllist.ndlls', 'dlllist.avg_dlls_per_proc',
+        'handles.nhandles', 'handles.avg_handles_per_proc', 'handles.nport',
+        'handles.nfile', 'handles.nevent', 'handles.ndesktop', 'handles.nkey',
+        'handles.nthread', 'handles.ndirectory', 'handles.nsemaphore',
+        'handles.ntimer', 'handles.nsection', 'handles.nmutant',
+        'ldrmodules.not_in_load', 'ldrmodules.not_in_init', 'ldrmodules.not_in_mem',
+        'ldrmodules.not_in_load_avg', 'ldrmodules.not_in_init_avg',
+        'ldrmodules.not_in_mem_avg', 'malfind.ninjections', 'malfind.commitCharge',
+        'malfind.uniqueInjections', 'psxview.not_in_pslist',
+        'psxview.not_in_eprocess_pool', 'psxview.not_in_ethread_pool',
+        'psxview.not_in_pspcreatereference', 'psxview.not_in_csrss_handles',
+        'psxview.not_in_session', 'psxview.not_in_deskthrd',
+        'psxview.not_in_pslist_false_avg', 'psxview.not_in_eprocess_pool_false_avg',
+        'psxview.not_in_ethread_pool_false_avg',
+        'psxview.not_in_pspcreatereference_false_avg',
+        'psxview.not_in_csrss_handles_false_avg',
+        'psxview.not_in_session_false_avg', 'psxview.not_in_deskthrd_false_avg',
+        'modules.nmodules', 'svcscan.nservices', 'svcscan.kernel_drivers',
+        'svcscan.fs_drivers', 'svcscan.process_services',
+        'svcscan.shared_process_services', 'svcscan.interactive_process_services',
+        'svcscan.nactive', 'callbacks.ncallbacks', 'callbacks.nanonymous',
+        'callbacks.ngeneric'
+    ]
+    
+    # --- HELPER FUNCTIONS ---
+    def extract_volatility_features(volatility_data: List[Dict]) -> Dict:
+        """
+        Extract CIC-MalMem-2022 features from volatility JSON output
+        """
+        features = {f: 0 for f in MALMEM_FEATURES}
+        
+        # Parse volatility plugins
+        plugins = {p['plugin']: p.get('results', []) for p in volatility_data if 'plugin' in p}
+        
+        # --- PSLIST ---
+        pslist = plugins.get('pslist', [])
+        if pslist:
+            features['pslist.nproc'] = len(pslist)
+            ppids = [p.get('ppid', 0) for p in pslist if isinstance(p, dict)]
+            features['pslist.nppid'] = len(set(ppids))
+            
+            threads = [p.get('threads', 0) for p in pslist if isinstance(p, dict)]
+            features['pslist.avg_threads'] = sum(threads) / len(threads) if threads else 0
+            
+            procs64 = sum(1 for p in pslist if isinstance(p, dict) and p.get('is64bit', False))
+            features['pslist.nprocs64bit'] = procs64
+            
+            handlers = [p.get('handles', 0) for p in pslist if isinstance(p, dict)]
+            features['pslist.avg_handlers'] = sum(handlers) / len(handlers) if handlers else 0
+        
+        # --- DLLLIST ---
+        dlllist = plugins.get('dlllist', [])
+        if dlllist:
+            all_dlls = []
+            for proc in dlllist:
+                if isinstance(proc, dict) and 'dlls' in proc:
+                    dlls = proc['dlls'] if isinstance(proc['dlls'], list) else []
+                    all_dlls.extend(dlls)
+            
+            features['dlllist.ndlls'] = len(all_dlls)
+            features['dlllist.avg_dlls_per_proc'] = len(all_dlls) / len(pslist) if pslist else 0
+        
+        # --- HANDLES ---
+        handles = plugins.get('handles', [])
+        if handles:
+            features['handles.nhandles'] = len(handles)
+            features['handles.avg_handles_per_proc'] = len(handles) / len(pslist) if pslist else 0
+            
+            handle_types = defaultdict(int)
+            for h in handles:
+                if isinstance(h, dict):
+                    htype = h.get('type', '').lower()
+                    handle_types[htype] += 1
+            
+            features['handles.nport'] = handle_types.get('port', 0)
+            features['handles.nfile'] = handle_types.get('file', 0)
+            features['handles.nevent'] = handle_types.get('event', 0)
+            features['handles.ndesktop'] = handle_types.get('desktop', 0)
+            features['handles.nkey'] = handle_types.get('key', 0)
+            features['handles.nthread'] = handle_types.get('thread', 0)
+            features['handles.ndirectory'] = handle_types.get('directory', 0)
+            features['handles.nsemaphore'] = handle_types.get('semaphore', 0)
+            features['handles.ntimer'] = handle_types.get('timer', 0)
+            features['handles.nsection'] = handle_types.get('section', 0)
+            features['handles.nmutant'] = handle_types.get('mutant', 0)
+        
+        # --- LDRMODULES ---
+        ldrmodules = plugins.get('ldrmodules', [])
+        if ldrmodules:
+            not_in_load = sum(1 for m in ldrmodules if isinstance(m, dict) and m.get('not_in_load', False))
+            not_in_init = sum(1 for m in ldrmodules if isinstance(m, dict) and m.get('not_in_init', False))
+            not_in_mem = sum(1 for m in ldrmodules if isinstance(m, dict) and m.get('not_in_mem', False))
+            
+            features['ldrmodules.not_in_load'] = not_in_load
+            features['ldrmodules.not_in_init'] = not_in_init
+            features['ldrmodules.not_in_mem'] = not_in_mem
+            
+            total_ldr = len(ldrmodules)
+            features['ldrmodules.not_in_load_avg'] = not_in_load / total_ldr if total_ldr > 0 else 0
+            features['ldrmodules.not_in_init_avg'] = not_in_init / total_ldr if total_ldr > 0 else 0
+            features['ldrmodules.not_in_mem_avg'] = not_in_mem / total_ldr if total_ldr > 0 else 0
+        
+        # --- MALFIND ---
+        malfind = plugins.get('malfind', [])
+        if malfind:
+            features['malfind.ninjections'] = len(malfind)
+            
+            commit_charges = [m.get('CommitCharge', 0) for m in malfind if isinstance(m, dict)]
+            features['malfind.commitCharge'] = sum(commit_charges)
+            
+            unique_injections = len(set(m.get('Address', '') for m in malfind if isinstance(m, dict)))
+            features['malfind.uniqueInjections'] = unique_injections
+        
+        # --- PSXVIEW ---
+        psxview = plugins.get('psxview', [])
+        if psxview:
+            not_in_pslist = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_pslist', False))
+            not_in_eprocess = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_eprocess_pool', False))
+            not_in_ethread = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_ethread_pool', False))
+            not_in_pspref = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_pspcreatereference', False))
+            not_in_csrss = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_csrss_handles', False))
+            not_in_session = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_session', False))
+            not_in_deskthrd = sum(1 for p in psxview if isinstance(p, dict) and p.get('not_in_deskthrd', False))
+            
+            features['psxview.not_in_pslist'] = not_in_pslist
+            features['psxview.not_in_eprocess_pool'] = not_in_eprocess
+            features['psxview.not_in_ethread_pool'] = not_in_ethread
+            features['psxview.not_in_pspcreatereference'] = not_in_pspref
+            features['psxview.not_in_csrss_handles'] = not_in_csrss
+            features['psxview.not_in_session'] = not_in_session
+            features['psxview.not_in_deskthrd'] = not_in_deskthrd
+            
+            total_psxview = len(psxview)
+            if total_psxview > 0:
+                features['psxview.not_in_pslist_false_avg'] = not_in_pslist / total_psxview
+                features['psxview.not_in_eprocess_pool_false_avg'] = not_in_eprocess / total_psxview
+                features['psxview.not_in_ethread_pool_false_avg'] = not_in_ethread / total_psxview
+                features['psxview.not_in_pspcreatereference_false_avg'] = not_in_pspref / total_psxview
+                features['psxview.not_in_csrss_handles_false_avg'] = not_in_csrss / total_psxview
+                features['psxview.not_in_session_false_avg'] = not_in_session / total_psxview
+                features['psxview.not_in_deskthrd_false_avg'] = not_in_deskthrd / total_psxview
+        
+        # --- MODULES ---
+        modules = plugins.get('modules', [])
+        if modules:
+            features['modules.nmodules'] = len(modules)
+        
+        # --- SVCSCAN ---
+        svcscan = plugins.get('svcscan', [])
+        if svcscan:
+            features['svcscan.nservices'] = len(svcscan)
+            
+            kernel_drivers = sum(1 for s in svcscan if isinstance(s, dict) and s.get('type') == 'kernel_driver')
+            fs_drivers = sum(1 for s in svcscan if isinstance(s, dict) and s.get('type') == 'fs_driver')
+            process_svcs = sum(1 for s in svcscan if isinstance(s, dict) and s.get('type') == 'process_service')
+            shared_process_svcs = sum(1 for s in svcscan if isinstance(s, dict) and s.get('type') == 'shared_process_service')
+            interactive_svcs = sum(1 for s in svcscan if isinstance(s, dict) and s.get('type') == 'interactive_process_service')
+            
+            features['svcscan.kernel_drivers'] = kernel_drivers
+            features['svcscan.fs_drivers'] = fs_drivers
+            features['svcscan.process_services'] = process_svcs
+            features['svcscan.shared_process_services'] = shared_process_svcs
+            features['svcscan.interactive_process_services'] = interactive_svcs
+            
+            active_services = sum(1 for s in svcscan if isinstance(s, dict) and s.get('state') == 'active')
+            features['svcscan.nactive'] = active_services
+        
+        # --- CALLBACKS ---
+        callbacks = plugins.get('callbacks', [])
+        if callbacks:
+            features['callbacks.ncallbacks'] = len(callbacks)
+            
+            anonymous = sum(1 for c in callbacks if isinstance(c, dict) and c.get('anonymous', False))
+            features['callbacks.nanonymous'] = anonymous
+            
+            generic = sum(1 for c in callbacks if isinstance(c, dict) and c.get('type', '').lower() == 'generic')
+            features['callbacks.ngeneric'] = generic
+        
+        return features
+    
+    def create_memory_csv(features: Dict) -> pd.DataFrame:
+        """Create DataFrame with extracted features"""
+        return pd.DataFrame([features])
+    
+    # --- UI LAYOUT ---
+    st.markdown("### 📤 Step 1: Submit Sample to Triage")
+    
+    col1, col2 = st.columns([2, 1])
+    mem_test_exe = col1.file_uploader("Upload .exe for Memory Analysis", type=["exe"], key="mem_test_exe")
+    run_mem_test = col2.button("▶ Submit & Extract", key="run_mem_test")
+    
+    if run_mem_test and mem_test_exe:
+        API_KEY = st.secrets["TRIAGE_API_KEY"]
+        HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+        BASE_URL = "https://api.tria.ge/v0"
+        
+        # --- SUBMIT TO TRIAGE ---
+        with st.spinner("Uploading to Triage sandbox..."):
+            files = {"file": (mem_test_exe.name, mem_test_exe.getvalue())}
+            data  = {"_json": '{"kind":"file","interactive":false}'}
+            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
+            
+            if res.status_code not in (200, 201):
+                st.error(f"Submission failed ({res.status_code}): {res.text}")
+                st.stop()
+            
+            sample_id = res.json().get("id")
+            st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
+        
+        # --- SELECT PROFILE ---
+        with st.spinner("Selecting analysis profile..."):
+            requests.post(
+                f"{BASE_URL}/samples/{sample_id}/profile",
+                headers={**HEADERS, "Content-Type": "application/json"},
+                data=json.dumps({"auto": True})
+            )
+        
+        # --- POLLING FOR COMPLETION ---
+        bar = st.progress(0)
+        status_text = st.empty()
+        MAX_ITER = 60
+        curr_status = "pending"
+        
+        for i in range(MAX_ITER):
+            time.sleep(5)
+            chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
+            if chk.status_code != 200:
+                continue
+            
+            curr_status = chk.json().get("status", "unknown")
+            bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
+            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
+            
+            if curr_status in ("reported", "failed"):
+                break
+        
+        if curr_status != "reported":
+            st.error("Triage analysis failed or timed out.")
+            st.stop()
+        
+        st.success("✅ Triage analysis complete!")
+        
+        # --- FETCH VOLATILITY DATA ---
+        st.markdown("### 🔍 Step 2: Extracting Volatility Features")
+        
+        with st.spinner("Fetching volatility JSON from Triage..."):
+            sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+            tasks_raw = sample_info.get("tasks", {})
+            
+            memory_task = None
+            if isinstance(tasks_raw, dict):
+                for full_tid, tinfo in tasks_raw.items():
+                    if tinfo.get("kind") == "memory":
+                        memory_task = full_tid
+                        break
+            elif isinstance(tasks_raw, list):
+                for t in tasks_raw:
+                    tid = t.get("id", "")
+                    if "memory" in tid.lower():
+                        memory_task = f"{sample_id}-{tid}" if "-" not in tid else tid
+                        break
+            
+            if not memory_task:
+                st.warning("⚠️ No memory analysis task found. Trying alternative endpoints...")
+                # Try to fetch any available volatility data
+                vol_res = requests.get(f"{BASE_URL}/samples/{sample_id}/volatility", headers=HEADERS)
+                if vol_res.status_code == 200:
+                    volatility_data = vol_res.json()
+                else:
+                    st.error("Could not retrieve volatility data from Triage API.")
+                    st.stop()
+            else:
+                vol_res = requests.get(
+                    f"{BASE_URL}/samples/{sample_id}/{memory_task}/logs/volatility.json",
+                    headers=HEADERS
+                )
+                
+                if vol_res.status_code != 200:
+                    st.error(f"Failed to fetch volatility.json ({vol_res.status_code})")
+                    st.stop()
+                
+                volatility_data = vol_res.json()
+            
+            st.success("✅ Volatility data retrieved!")
+        
+        # --- EXTRACT FEATURES ---
+        st.markdown("### 📊 Step 3: Computing CIC-MalMem-2022 Features")
+        
+        with st.spinner("Calculating 52 memory features..."):
+            if isinstance(volatility_data, dict) and 'analysis' in volatility_data:
+                vol_list = volatility_data['analysis'].get('memory', {}).get('volatility', [])
+            elif isinstance(volatility_data, list):
+                vol_list = volatility_data
+            else:
+                vol_list = [volatility_data] if isinstance(volatility_data, dict) else []
+            
+            features = extract_volatility_features(vol_list)
+            mem_df = create_memory_csv(features)
+            
+            st.success("✅ Features extracted successfully!")
+        
+        # --- DISPLAY FEATURES ---
+        with st.expander("📋 View All Extracted Features", expanded=False):
+            st.dataframe(mem_df.T, use_container_width=True)
+        
+        # --- CSV DOWNLOAD ---
+        st.markdown("### 💾 Step 4: Download & Test")
+        
+        csv_buffer = BytesIO()
+        mem_df.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        
+        st.download_button(
+            label="📥 Download Memory Features CSV",
+            data=csv_buffer.getvalue(),
+            file_name=f"memory_features_{sample_id}.csv",
+            mime="text/csv"
+        )
+        
+        # --- STAGE 3 CLASSIFICATION ---
+        st.markdown("### 🎯 Step 5: Stage 3 Memory Classification")
+        
+        if st.button("🔬 Run Random Forest Classifier", key="run_rf_mem"):
+            with st.spinner("Running memory classifier..."):
+                # Clean dataframe
+                test_df = mem_df.copy()
+                if 'Class' in test_df.columns:
+                    test_df = test_df.drop('Class', axis=1)
+                
+                # Apply scaler if available
+                if mem_scaler:
+                    mem_features_scaled = mem_scaler.transform(test_df)
+                else:
+                    mem_features_scaled = test_df.values
+                
+                # Predict
+                mem_pred = rf_mem.predict(mem_features_scaled)[0]
+                mem_prob = rf_mem.predict_proba(mem_features_scaled)[0]
+                mem_conf = max(mem_prob)
+                
+                final_verdict = "🔴 RANSOMWARE" if mem_pred == 1 else "🟢 BENIGN"
+                
+                st.divider()
+                st.metric("Memory Analysis Verdict", final_verdict, f"{mem_conf*100:.2f}% Confidence")
+                
+                col1, col2 = st.columns(2)
+                col1.metric("Ransomware Probability", f"{mem_prob[1]*100:.2f}%")
+                col2.metric("Benign Probability", f"{mem_prob[0]*100:.2f}%")
+                
+                st.info("✅ Memory classification complete! This would be your final Stage 3 verdict in the full pipeline.")
+    
+    st.markdown("---")
+    st.markdown("""
+    ### 📝 How It Works:
+    
+    1. **Submit** your .exe to Triage API for sandbox analysis
+    2. **Extract** raw volatility data (pslist, dlllist, handles, etc.)
+    3. **Compute** all 52 CIC-MalMem-2022 features from the volatility output
+    4. **Download** the CSV for external testing or use
+    5. **Classify** using the Random Forest memory model for final verdict
+    
+    This tab lets you validate the entire memory analysis pipeline independently before integrating into the full gated pipeline in Tab 3!
+    """)
