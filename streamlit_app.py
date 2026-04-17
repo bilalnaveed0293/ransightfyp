@@ -292,8 +292,15 @@ with tab2:
                 time.sleep(5)
 
             onemon_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json", headers=HEADERS, stream=True)
-            if onemon_res.status_code != 200: continue
+            if onemon_res.status_code != 200:
+                short_id = full_task_id.split("-")[-1]
+                onemon_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{short_id}/logs/onemon.json", headers=HEADERS, stream=True)
+                if onemon_res.status_code != 200: continue
 
+            task_apis    = []
+            task_dlls    = []
+            task_mutexes = []
+            
             for line in onemon_res.iter_lines():
                 if not line: continue
                 try: event = json.loads(line)
@@ -305,23 +312,26 @@ with tab2:
                     api_name = evt.get("api") or evt.get("symbol") or evt.get("name") or evt.get("sys_name")
                     if not api_name and "kind" in evt: api_name = f"Syscall_{evt['kind']}"
                     elif not api_name and "sys" in evt: api_name = f"Syscall_{evt['sys']}"
-                    if api_name: raw_apis.append(str(api_name))
+                    if api_name: task_apis.append(str(api_name))
 
                 action_name = evt.get("action")
-                if action_name: raw_apis.append(str(action_name))
+                if action_name: task_apis.append(str(action_name))
 
                 for key in ["path", "filepath", "image", "arg0", "arg1", "name"]:
                     val = evt.get(key, "")
                     if isinstance(val, str) and ".dll" in val.lower():
                         dll_name = val.replace("\\", "/").split("/")[-1]
-                        if dll_name.lower().endswith(".dll") and dll_name not in raw_dlls:
-                            raw_dlls.append(dll_name)
+                        if dll_name.lower().endswith(".dll") and dll_name not in task_dlls:
+                            task_dlls.append(dll_name)
 
                 if kind == "onemon.Mutant" or (kind == "onemon.Handle" and evt.get("type") == "Mutant"):
                     name = evt.get("name") or evt.get("path") or evt.get("mutant") or evt.get("obj")
-                    if name and name not in raw_mutexes: raw_mutexes.append(str(name))
+                    if name and name not in task_mutexes: task_mutexes.append(str(name))
 
-            if raw_apis or raw_dlls or raw_mutexes:
+            if task_apis or task_dlls or task_mutexes:
+                raw_apis = task_apis
+                raw_dlls = task_dlls
+                raw_mutexes = task_mutexes
                 successful_task = full_task_id
                 st.success(f"✅ Got behavioral data from task: `{full_task_id}`")
                 break
@@ -330,6 +340,10 @@ with tab2:
         if not final_sequence.strip():
             st.error("No behavioral data found.")
             st.stop()
+
+        with st.expander("🔍 Extraction Summary"):
+            st.write(f"Successful task: `{successful_task}`")
+            st.write(f"APIs: **{len(raw_apis)}** | DLLs: **{len(raw_dlls)}** | Mutexes: **{len(raw_mutexes)}**")
 
         probs = predict_proba_lstm([final_sequence])[0]
         st.divider()
@@ -362,6 +376,7 @@ with tab3:
     gated_csv = st.file_uploader("2️⃣ Upload Memory Features CSV (Required if escalated to Stage 3)", type=["csv"], key="gate_csv")
 
     if st.button("▶ Run Gated Pipeline") and gated_exe:
+        # We read the file once here for Stage 1 (this moves the internal pointer to the end)
         file_bytes = gated_exe.read()
         
         # ---------------------------------------------------------
@@ -403,74 +418,146 @@ with tab3:
         HEADERS = {"Authorization": f"Bearer {API_KEY}"}
         BASE_URL = "https://api.tria.ge/v0"
 
-        with st.spinner("Executing in Triage Sandbox (60s)..."):
-            files = {"file": (gated_exe.name, file_bytes)}
+        with st.spinner("Uploading to Triage sandbox..."):
+            # CRITICAL FIX: Use .getvalue() directly! This prevents uploading an empty 0-byte file
+            # after .read() was consumed by Stage 1. This guarantees Tab 2 parity.
+            files = {"file": (gated_exe.name, gated_exe.getvalue())}
             data  = {"_json": '{"kind":"file","interactive":false}'}
-            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
-            
-            if res.status_code not in (200, 201):
-                st.error("Triage Sandbox API failed. Cannot proceed.")
-                st.stop()
-                
-            sample_id = res.json().get("id")
-            requests.post(f"{BASE_URL}/samples/{sample_id}/profile", headers={**HEADERS, "Content-Type": "application/json"}, data=json.dumps({"auto": True}))
 
-        # Polling
-        bar = st.progress(0)
+            res = requests.post(f"{BASE_URL}/samples", headers=HEADERS, files=files, data=data)
+            if res.status_code not in (200, 201):
+                st.error(f"Submission failed ({res.status_code}): {res.text}")
+                st.stop()
+
+            sample_id = res.json().get("id")
+            st.info(f"✅ Submitted — Sample ID: `{sample_id}`")
+
+        with st.spinner("Selecting analysis profile..."):
+            requests.post(
+                f"{BASE_URL}/samples/{sample_id}/profile",
+                headers={**HEADERS, "Content-Type": "application/json"},
+                data=json.dumps({"auto": True})
+            )
+
+        bar         = st.progress(0)
+        status_text = st.empty()
+        MAX_ITER    = 60
         curr_status = "pending"
-        for i in range(60):
+
+        for i in range(MAX_ITER):
             time.sleep(5)
             chk = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS)
-            if chk.status_code == 200:
-                curr_status = chk.json().get("status", "unknown")
-                bar.progress(int(min((i + 1) / 60 * 100, 100)))
-                if curr_status in ("reported", "failed"): break
+            if chk.status_code != 200: continue
+            curr_status = chk.json().get("status", "unknown")
+            bar.progress(int(min((i + 1) / MAX_ITER * 100, 100)))
+            status_text.text(f"Status: {curr_status}  ({(i+1)*5}s / {MAX_ITER*5}s)")
+            if curr_status in ("reported", "failed"): break
 
-        if curr_status != "reported":
-            st.error("Sandbox execution failed or timed out. Forcing escalation to Stage 3.")
-            conf_s2 = 0.0 
+        if curr_status == "failed" or curr_status != "reported":
+            st.error("Triage analysis failed or timed out. Forcing escalation to Stage 3.")
+            conf_s2 = 0.0
         else:
-            # Extraction
-            with st.spinner("Extracting Sequence Data..."):
-                sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
-                tasks_raw = sample_info.get("tasks", {})
-                b_tasks = [tid if "-" in tid else f"{sample_id}-{tid}" for tid in (tasks_raw.keys() if isinstance(tasks_raw, dict) else [t.get("id","") for t in tasks_raw]) if "behavioral" in tid]
-                
-                raw_apis, raw_dlls, raw_mutexes = [], [], []
-                for full_task_id in b_tasks:
-                    onemon_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json", headers=HEADERS, stream=True)
-                    if onemon_res.status_code == 200:
-                        for line in onemon_res.iter_lines():
-                            if not line: continue
-                            try: evt_data = json.loads(line)
-                            except: continue
-                            kind, evt = evt_data.get("kind", ""), evt_data.get("event", {})
-                            
-                            if kind == "onemon.Call" or kind.startswith("onemon.Syscall"):
-                                api_name = evt.get("api") or evt.get("symbol") or evt.get("name") or evt.get("sys_name")
-                                if api_name: raw_apis.append(str(api_name))
-                            
-                            for k in ["path", "image", "arg0", "name"]:
-                                val = evt.get(k, "")
-                                if isinstance(val, str) and ".dll" in val.lower() and val.split("/")[-1] not in raw_dlls:
-                                    raw_dlls.append(val.split("/")[-1])
-                                    
-                            if kind == "onemon.Mutant":
-                                m_name = evt.get("name") or evt.get("path")
-                                if m_name and m_name not in raw_mutexes: raw_mutexes.append(str(m_name))
-                        if raw_apis: break
-
-                final_seq = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+            sample_info = requests.get(f"{BASE_URL}/samples/{sample_id}", headers=HEADERS).json()
+            tasks_raw   = sample_info.get("tasks", {})
+            behavioral_tasks = []
             
-            if not final_seq.strip():
-                st.warning("No dynamic sequence captured. Forcing escalation.")
+            if isinstance(tasks_raw, dict):
+                for full_tid, tinfo in tasks_raw.items():
+                    if tinfo.get("kind") == "behavioral": behavioral_tasks.append(full_tid)
+            elif isinstance(tasks_raw, list):
+                for t in tasks_raw:
+                    tid = t.get("id", "")
+                    if tid.startswith("behavioral"):
+                        behavioral_tasks.append(f"{sample_id}-{tid}" if "-" not in tid else tid)
+
+            if not behavioral_tasks:
+                st.error(f"No behavioral tasks found. Forcing escalation.")
                 conf_s2 = 0.0
             else:
-                probs = predict_proba_lstm([final_seq])[0]
-                prob_ransom_s2 = probs[1]
-                verdict_s2 = "RANSOMWARE" if prob_ransom_s2 > 0.5 else "BENIGN"
-                conf_s2 = prob_ransom_s2 if prob_ransom_s2 > 0.5 else probs[0]
-                st.metric("Stage 2 Verdict", verdict_s2, f"{conf_s2*100:.2f}% Confidence")
+                raw_apis    = []
+                raw_dlls    = []
+                raw_mutexes = []
+                successful_task = None
+
+                for full_task_id in behavioral_tasks:
+                    st.info(f"Fetching onemon.json for task `{full_task_id}`...")
+                    for _ in range(20):
+                        task_chk = requests.get(f"{BASE_URL}/samples/{sample_id}/{full_task_id}", headers=HEADERS)
+                        if task_chk.status_code == 200 and task_chk.json().get("status") == "reported": break
+                        time.sleep(5)
+
+                    onemon_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{full_task_id}/logs/onemon.json", headers=HEADERS, stream=True)
+                    
+                    if onemon_res.status_code != 200:
+                        short_id = full_task_id.split("-")[-1]
+                        onemon_res = requests.get(f"{BASE_URL}/samples/{sample_id}/{short_id}/logs/onemon.json", headers=HEADERS, stream=True)
+                        if onemon_res.status_code != 200: 
+                            continue
+
+                    task_apis    = []
+                    task_dlls    = []
+                    task_mutexes = []
+
+                    for line in onemon_res.iter_lines():
+                        if not line: continue
+                        try: event = json.loads(line)
+                        except: continue
+
+                        kind = event.get("kind", "")
+                        evt  = event.get("event", {})
+
+                        if kind == "onemon.Call" or kind.startswith("onemon.Syscall"):
+                            api_name = evt.get("api") or evt.get("symbol") or evt.get("name") or evt.get("sys_name")
+                            if not api_name and "kind" in evt: api_name = f"Syscall_{evt['kind']}"
+                            elif not api_name and "sys" in evt: api_name = f"Syscall_{evt['sys']}"
+                            if api_name: task_apis.append(str(api_name))
+
+                        action_name = evt.get("action")
+                        if action_name: task_apis.append(str(action_name))
+
+                        for key in ["path", "filepath", "image", "arg0", "arg1", "name"]:
+                            val = evt.get(key, "")
+                            if isinstance(val, str) and ".dll" in val.lower():
+                                dll_name = val.replace("\\", "/").split("/")[-1]
+                                if dll_name.lower().endswith(".dll") and dll_name not in task_dlls:
+                                    task_dlls.append(dll_name)
+
+                        if kind == "onemon.Mutant" or (kind == "onemon.Handle" and evt.get("type") == "Mutant"):
+                            name = evt.get("name") or evt.get("path") or evt.get("mutant") or evt.get("obj")
+                            if name and name not in task_mutexes: task_mutexes.append(str(name))
+
+                    if task_apis or task_dlls or task_mutexes:
+                        raw_apis    = task_apis
+                        raw_dlls    = task_dlls
+                        raw_mutexes = task_mutexes
+                        successful_task = full_task_id
+                        st.success(f"✅ Got behavioral data from task: `{full_task_id}`")
+                        break
+                    else:
+                        st.warning(f"No API/DLL/Mutex data extracted in `{full_task_id}` — trying next task...")
+
+                final_seq = " ".join(raw_apis[:500] + raw_dlls[:10] + raw_mutexes[:10])
+                
+                if not final_seq.strip():
+                    st.warning("No dynamic sequence captured. Forcing escalation.")
+                    conf_s2 = 0.0
+                else:
+                    with st.expander("🔍 Extraction Summary"):
+                        st.write(f"Successful task: `{successful_task}`")
+                        st.write(f"APIs: **{len(raw_apis)}** | DLLs: **{len(raw_dlls)}** | Mutexes: **{len(raw_mutexes)}**")
+                    
+                    probs = predict_proba_lstm([final_seq])[0]
+                    prob_ransom_s2 = probs[1]
+                    verdict_s2 = "RANSOMWARE" if prob_ransom_s2 > 0.5 else "BENIGN"
+                    conf_s2 = prob_ransom_s2 if prob_ransom_s2 > 0.5 else probs[0]
+                    
+                    st.metric("Stage 2 Verdict", verdict_s2, f"{conf_s2*100:.2f}% Confidence")
+                    
+                    with st.spinner("Generating LIME explanation for Stage 2..."):
+                        explainer = LimeTextExplainer(class_names=["Benign", "Ransomware"])
+                        exp = explainer.explain_instance(final_seq, predict_proba_lstm, num_features=10)
+                        st.write("### 🧠 Top Features (APIs / DLLs / Mutexes)")
+                        components.html(exp.as_html(), height=400, scrolling=True)
 
         if conf_s2 >= theta_2:
             st.success(f"✅ Stage 2 Confidence ({conf_s2:.2f}) meets θ2 threshold ({theta_2:.2f}). Exiting pipeline!")
